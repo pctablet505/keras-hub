@@ -61,6 +61,9 @@ def main(_):
     quantized_preset = f"{preset}_int8"
     backbone.save_to_preset(quantized_preset)
     tokenizer.save_to_preset(quantized_preset)
+    if hasattr(causal_lm.preprocessor,"image_converter"):
+        image_converter=causal_lm.preprocessor.image_converter
+        image_converter.save_to_preset(quantized_preset)
     print(f"🏁 Preset saved to ./{quantized_preset}")
 
     if upload_uri:
