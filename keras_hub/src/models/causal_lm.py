@@ -59,6 +59,47 @@ class CausalLM(Task):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def prune(self, sparsity, layers_to_prune=None, method="l1", **kwargs):
+        """
+        Prune the CausalLM model by delegating to the backbone.
+
+        Args:
+            sparsity: Float between 0 and 1. Fraction of weights to prune.
+            layers_to_prune: Optional specification of which layers to prune. Can be:
+                - None: Prune all eligible layers (default)
+                - List of layer names: Only prune layers with names in the list
+                - List of regex patterns: Prune layers whose names match any pattern
+                - Single string: Treated as a layer name or regex pattern
+            method: Pruning method. Default "l1" for magnitude-based pruning.
+            **kwargs: Additional arguments passed to pruning methods.
+
+        Returns:
+            Dictionary containing pruning statistics.
+        """
+        if hasattr(self.backbone, 'prune') and hasattr(self.backbone.prune, '__call__'):
+            return self.backbone.prune(
+                sparsity=sparsity, 
+                layers_to_prune=layers_to_prune, 
+                method=method, 
+                **kwargs
+            )
+        else:
+            # Import here to avoid circular imports
+            try:
+                from keras.src.pruning.core import apply_pruning_to_model
+                return apply_pruning_to_model(
+                    model=self.backbone, 
+                    sparsity=sparsity, 
+                    method=method, 
+                    layers_to_prune=layers_to_prune,
+                    **kwargs
+                )
+            except ImportError:
+                raise ImportError(
+                    "Pruning functionality not available. Please ensure Keras with "
+                    "pruning support is installed and available in your environment."
+                )
+
     def compile(
         self,
         optimizer="auto",
