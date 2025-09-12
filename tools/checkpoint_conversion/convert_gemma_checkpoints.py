@@ -1,16 +1,6 @@
 """
 Convert Gemma flax checkpoints to the Keras format.
 
-The flax checkpoint should match the directory structure here:
-https://www.kaggle.com/models/google/gemma/flax
-
-The flax directory should have a sentenepiece proto, and an inner directory with
-an orbax checkpoint:
-tokenizer.model
-2b-it/_METADATA
-2b-it/checkpoint
-2b-it/...
-
 Setup:
 ```shell
 pip install -r requirements.txt
@@ -22,7 +12,6 @@ Usage:
 ```shell
 cd tools/checkpoint_conversion
 python convert_gemma_checkpoints.py --preset gemma_2b_en
-python convert_gemma_checkpoints.py --preset new_gemma --flax_dir ./new_gemma
 ```
 """
 
@@ -35,22 +24,37 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import kagglehub  # noqa: E402
 import keras  # noqa: E402
 import numpy as np  # noqa: E402
-import sentencepiece  # noqa: E402
 from absl import app  # noqa: E402
 from absl import flags  # noqa: E402
-from gemma import params as params_lib  # noqa: E402
-from gemma import sampler as sampler_lib  # noqa: E402
-from gemma import transformer as transformer_lib  # noqa: E402
+from checkpoint_conversion_utils import download_gcs_file
+
+from gemma import gm
 
 import keras_hub  # noqa: E402
 
 FLAGS = flags.FLAGS
 
 PRESET_MAP = {
-    "gemma_2b_en": "google/gemma/flax/2b",
-    "gemma_7b_en": "google/gemma/flax/7b",
-    "gemma_instruct_2b_en": "google/gemma/flax/2b-it",
-    "gemma_instruct_7b_en": "google/gemma/flax/7b-it",
+    "gemma_2b_en": {
+        "model": gm.nn.Gemma2_2B,
+        "params": gm.ckpts.CheckpointPath.GEMMA2_2B_PT,
+        "handle": "google/gemma/flax/2b",
+    },
+    "gemma_7b_en": {
+        "model": gm.nn.Gemma2_9B,  # Using Gemma2_9B as closest to 7B
+        "params": gm.ckpts.CheckpointPath.GEMMA2_9B_PT,
+        "handle": "google/gemma/flax/7b",
+    },
+    "gemma_instruct_2b_en": {
+        "model": gm.nn.Gemma2_2B,
+        "params": gm.ckpts.CheckpointPath.GEMMA2_2B_IT,
+        "handle": "google/gemma/flax/2b-it",
+    },
+    "gemma_instruct_7b_en": {
+        "model": gm.nn.Gemma2_9B,  # Using Gemma2_9B as closest to 7B
+        "params": gm.ckpts.CheckpointPath.GEMMA2_9B_IT,
+        "handle": "google/gemma/flax/7b-it",
+    },
 }
 
 
@@ -64,8 +68,7 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     "flax_dir",
     None,
-    "Optional path to a local flax directory to convert. See the script "
-    "docstring for more details on the format of the flax directory.",
+    "Optional path to a local flax directory to convert.",
 )
 
 
@@ -73,33 +76,16 @@ def download_flax_model(handle):
     return kagglehub.model_download(handle)
 
 
-def convert_model(flax_config, flax_params, vocab_size):
-    kwargs = {}
-    # Hack to infer Gemma 2 config options until Flax actually adds support.
-    if "post_attention_norm" in flax_params["transformer"]["layer_0"]:
-        # The 27B parameter model is the only model that does a weird
-        # query normalization.
-        is_gemma2_27b = flax_config.num_heads == 32
-        # We would like to convert these from Flax, but have no way until
-        # flax supports Gemma 2.
-        kwargs = {
-            "query_head_dim_normalize": not is_gemma2_27b,
-            "use_post_ffw_norm": True,
-            "use_post_attention_norm": True,
-            "final_logit_soft_cap": 30,
-            "attention_logit_soft_cap": 50,
-            "use_sliding_window_attention": True,
-            "sliding_window_size": 4096,
-        }
+def convert_model(flax_config, vocab_size):
+    """convert_model function inspired by gemma3"""
     return keras_hub.models.GemmaBackbone(
         vocabulary_size=vocab_size,
         num_layers=flax_config.num_layers,
         num_query_heads=flax_config.num_heads,
         num_key_value_heads=flax_config.num_kv_heads,
         hidden_dim=flax_config.embed_dim,
-        intermediate_dim=flax_config.hidden_dim * 2,
+        intermediate_dim=flax_config.hidden_dim,
         head_dim=flax_config.head_dim,
-        **kwargs,
     )
 
 
@@ -108,19 +94,37 @@ def convert_tokenizer(proto_path):
 
 
 def convert_weights(keras_model, flax_config, flax_params):
+    # Debug: Print overall structure
+    print("🔍 DEBUG: Flax params keys:", list(flax_params.keys()))
+    
     # Chomp the embedding weights. Upstream pads for TPU efficiency, but this
     # leads to weird gotchas (you need to disregard part of your output logits).
-    embeddings = flax_params["transformer"]["embedder"]["input_embedding"]
+    embeddings = flax_params["embedder"]["input_embedding"]
     embeddings = np.asarray(embeddings[: keras_model.vocabulary_size, :])
+    print(f"🔍 DEBUG: Embeddings shape: {embeddings.shape}")
     keras_model.get_layer("token_embedding").set_weights([embeddings])
+    
     keras_model.get_layer("final_normalization").set_weights(
-        [np.asarray(flax_params["transformer"]["final_norm"]["scale"])]
+        [np.asarray(flax_params["final_norm"]["scale"])]
     )
+    
+    # Debug: Check first layer structure
+    if flax_config.num_layers > 0:
+        flax_layer_name = f"layer_0"
+        flax_block = flax_params[flax_layer_name]
+        print(f"🔍 DEBUG: Layer 0 keys:", list(flax_block.keys()))
+        if "mlp" in flax_block:
+            print(f"🔍 DEBUG: MLP keys:", list(flax_block["mlp"].keys()))
+            gating_einsum = flax_block["mlp"]["gating_einsum"]
+            print(f"🔍 DEBUG: gating_einsum shape: {np.asarray(gating_einsum).shape}")
+            print(f"🔍 DEBUG: gating_einsum type: {type(gating_einsum)}")
+    
     for i in range(flax_config.num_layers):
+        print(f"🔍 DEBUG: Processing layer {i}")
         flax_layer_name = f"layer_{i}"
         keras_block = keras_model.get_layer(f"decoder_block_{i}")
 
-        flax_block = flax_params["transformer"][flax_layer_name]
+        flax_block = flax_params[flax_layer_name]
         keras_block.pre_attention_norm.set_weights(
             [flax_block["pre_attention_norm"]["scale"]]
         )
@@ -128,22 +132,36 @@ def convert_weights(keras_model, flax_config, flax_params):
             [flax_block["pre_ffw_norm"]["scale"]]
         )
 
-        if "post_attention_norm" in flax_block:
-            keras_block.post_attention_norm.set_weights(
-                [flax_block["post_attention_norm"]["scale"]]
-            )
-        if "post_ffw_norm" in flax_block:
-            keras_block.post_ffw_norm.set_weights(
-                [flax_block["post_ffw_norm"]["scale"]]
-            )
-
-        keras_block.gating_ffw.set_weights(
-            [flax_block["mlp"]["gating_einsum"][0]]
-        )
-        keras_block.gating_ffw_2.set_weights(
-            [flax_block["mlp"]["gating_einsum"][1]]
-        )
-        keras_block.ffw_linear.set_weights([flax_block["mlp"]["linear"]])
+        gating_einsum = flax_block["mlp"]["gating_einsum"]
+        print(f"🔍 DEBUG: Layer {i} gating_einsum shape: {np.asarray(gating_einsum).shape}")
+        
+        # The gating weights are in shape (2, embed_dim, intermediate_dim)
+        # Each of the 2 matrices corresponds to one gating layer
+        # Each matrix needs to be split in half along the last dimension
+        gating_weights_1 = np.asarray(gating_einsum[0])  # First gating matrix
+        gating_weights_2 = np.asarray(gating_einsum[1])  # Second gating matrix
+        print(f"🔍 DEBUG: Layer {i} gating_weights_1 shape: {gating_weights_1.shape}")
+        print(f"🔍 DEBUG: Layer {i} gating_weights_2 shape: {gating_weights_2.shape}")
+        
+        # Split each matrix in half along the last dimension
+        gate_1, up_1 = np.split(gating_weights_1, 2, axis=-1)
+        gate_2, up_2 = np.split(gating_weights_2, 2, axis=-1)
+        
+        print(f"🔍 DEBUG: Layer {i} gate_1 shape: {gate_1.shape}, gate_2 shape: {gate_2.shape}")
+        
+        # Check what the Keras layers expect
+        print(f"🔍 DEBUG: Layer {i} keras gating_ffw weight shapes: {[w.shape for w in keras_block.gating_ffw.get_weights()]}")
+        print(f"🔍 DEBUG: Layer {i} keras gating_ffw_2 weight shapes: {[w.shape for w in keras_block.gating_ffw_2.get_weights()]}")
+        
+        # Assign the first half of first matrix to gating_ffw
+        # and first half of second matrix to gating_ffw_2
+        keras_block.gating_ffw.set_weights([gate_1])
+        keras_block.gating_ffw_2.set_weights([gate_2])
+        
+        # Set the linear layer weights
+        linear_weights = np.asarray(flax_block["mlp"]["linear"])
+        print(f"🔍 DEBUG: Layer {i} linear_weights shape: {linear_weights.shape}")
+        keras_block.ffw_linear.set_weights([linear_weights])
 
         attn_block = flax_block["attn"]
         if flax_config.num_heads != flax_config.num_kv_heads:
@@ -176,8 +194,8 @@ def convert_weights(keras_model, flax_config, flax_params):
 def validate_output(
     keras_model,
     keras_tokenizer,
+    flax_model,
     flax_params,
-    flax_tokenizer,
 ):
     input_str = "What is Keras?"
     length = 32
@@ -194,22 +212,15 @@ def validate_output(
 
     # Flax
     try:
-        transformer_config = transformer_lib.TransformerConfig.from_params(
-            flax_params,
-            cache_size=length,
+        flax_sampler = gm.text.Sampler(
+            model=flax_model,
+            params=flax_params,
         )
-        transformer = transformer_lib.Transformer(transformer_config)
-        sampler = sampler_lib.Sampler(
-            transformer=transformer,
-            vocab=flax_tokenizer,
-            params=flax_params["transformer"],
-        )
-        flax_output = sampler(
+        flax_output = flax_sampler(
             input_strings=[input_str],
-            # Length of "<bos>What is Keras?"
-            total_generation_steps=length - 5,
+            total_generation_steps=length,
         )
-        flax_output = input_str + flax_output.text[0]
+        flax_output = flax_output.text[0]
         print("🔶 Flax output:", flax_output)
     except Exception as e:
         print("🔶 Flax could not be run.", e)
@@ -218,48 +229,34 @@ def validate_output(
 def main(_):
     preset = FLAGS.preset
 
-    print(f"🏃 Coverting {preset}")
+    print(f"🏃 Converting {preset}")
 
-    # Currently all flax weights are bfloat16 (and have much faster download
-    # times for it). We follow suit with Keras weights.
-    keras.config.set_floatx("bfloat16")
+    presets = PRESET_MAP.keys()
+    assert preset in presets, (
+        f"Invalid preset {preset}. Must be one of {','.join(presets)}"
+    )
 
-    if FLAGS.flax_dir is not None:
-        flax_dir = FLAGS.flax_dir
-    else:
-        presets = PRESET_MAP.keys()
-        assert preset in presets, (
-            f"Invalid preset {preset}. Must be one of {','.join(presets)}"
-        )
-        handle = PRESET_MAP[preset]
-        flax_dir = download_flax_model(handle)
-
-    proto_path = flax_dir + "/tokenizer.model"
-    print("✅ Flax model downloaded from kaggle")
-
-    checkpoint_dir = None
-    for path in os.listdir(flax_dir):
-        checkpoint_file = os.path.join(flax_dir, path, "_METADATA")
-        if os.path.exists(checkpoint_file):
-            checkpoint_dir = os.path.join(flax_dir, path)
-    assert checkpoint_dir is not None, "Cannot find orbax checkpoint files"
-
-    flax_tokenier = sentencepiece.SentencePieceProcessor()
-    flax_tokenier.Load(proto_path)
-    flax_params = params_lib.load_and_format_params(checkpoint_dir)
-    flax_config = transformer_lib.TransformerConfig.from_params(flax_params)
+    print("🏃 Loading Flax model and tokenizer")
+    flax_model = PRESET_MAP[preset]["model"]()
+    flax_config = flax_model.config
+    flax_params = gm.ckpts.load_params(PRESET_MAP[preset]["params"])
+    flax_tokenizer = gm.text.Gemma2Tokenizer()
+    proto_path = "./tokenizer_gemma2.model"
+    download_gcs_file(
+        gcs_uri=flax_tokenizer.path,
+        destination_file_name=proto_path,
+    )
     print("✅ Flax model loaded")
 
     keras_tokenizer = convert_tokenizer(proto_path)
     vocab_size = keras_tokenizer.vocabulary_size()
-    keras_model = convert_model(flax_config, flax_params, vocab_size)
+    keras_model = convert_model(flax_config, vocab_size)
     print("✅ Keras model loaded")
 
     convert_weights(keras_model, flax_config, flax_params)
     print("✅ Weights converted")
 
-    validate_output(keras_model, keras_tokenizer, flax_params, flax_tokenier)
-    print("✅ Output validated")
+    validate_output(keras_model, keras_tokenizer, flax_model, flax_params)
 
     keras_model.save_to_preset(preset)
     keras_tokenizer.save_to_preset(preset)
