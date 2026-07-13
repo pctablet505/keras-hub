@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import keras
 import pytest
 from keras import ops
 
@@ -112,13 +113,14 @@ class GPTNeoXCausalLMTest(TestCase):
         )
 
     def test_litert_export(self):
-        pytest.skip(reason="TODO: Fix TFLite export bug for GPTNeoX")
+        if keras.backend.backend() == "tensorflow":
+            self.skipTest(
+                "GPTNeoXCausalLM LiteRT export is not yet supported on the "
+                "TensorFlow backend."
+            )
         self.run_litert_export_test(
             cls=GPTNeoXCausalLM,
             init_kwargs=self.init_kwargs,
             input_data=self.input_data,
-            output_thresholds={
-                "max": 1e-3,
-                "mean": 1e-4,
-            },  # More lenient thresholds for numerical differences
+            output_thresholds={"*": {"max": 1e-3, "mean": 1e-4}},
         )

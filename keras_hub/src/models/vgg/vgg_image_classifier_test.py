@@ -1,3 +1,4 @@
+import keras
 import numpy as np
 import pytest
 
@@ -52,8 +53,12 @@ class VGGImageClassifierTest(TestCase):
             input_data=self.images,
         )
 
-    @pytest.mark.skip(reason="TODO: Bug with VGGImageClassifier liteRT export")
     def test_litert_export(self):
+        if keras.backend.backend() == "tensorflow":
+            self.skipTest(
+                "VGGImageClassifier LiteRT export is not yet supported on the "
+                "TensorFlow backend."
+            )
         self.run_litert_export_test(
             cls=VGGImageClassifier,
             init_kwargs=self.init_kwargs,

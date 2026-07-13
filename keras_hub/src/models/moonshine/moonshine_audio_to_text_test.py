@@ -145,10 +145,12 @@ class MoonshineAudioToTextTest(TestCase):
             input_data=self.input_data,
         )
 
-    @pytest.mark.skip(
-        reason="TODO: Bug with MoonshineAudioToText liteRT export"
-    )
     def test_litert_export(self):
+        if keras.backend.backend() == "tensorflow":
+            self.skipTest(
+                "MoonshineAudioToText LiteRT export is not yet supported on "
+                "the TensorFlow backend."
+            )
         self.run_litert_export_test(
             cls=MoonshineAudioToText,
             init_kwargs=self.init_kwargs,

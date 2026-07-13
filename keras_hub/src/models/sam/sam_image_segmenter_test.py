@@ -1,3 +1,4 @@
+import keras
 import numpy as np
 import pytest
 
@@ -132,9 +133,11 @@ class SAMImageSegmenterTest(TestCase):
             )
 
     def test_litert_export(self):
-        pytest.skip(
-            reason="TODO: Need to fix the bug in TFLite export for SAM model"
-        )
+        if keras.backend.backend() == "tensorflow":
+            self.skipTest(
+                "SAMImageSegmenter LiteRT export is not yet supported on the "
+                "TensorFlow backend."
+            )
         self.run_litert_export_test(
             cls=SAMImageSegmenter,
             init_kwargs=self.init_kwargs,
