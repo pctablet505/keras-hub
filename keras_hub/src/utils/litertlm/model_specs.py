@@ -445,7 +445,8 @@ class LiteRTLMExportSpec:
                 "`preprocessor.num_vision_tokens_per_image`."
             )
         num_vision_tokens = num_vision_tokens_per_image * max_images
-        patch_size = getattr(vision_encoder, "patch_size", None)
+        # Fall back to 16 when the encoder does not declare a patch size.
+        patch_size = getattr(vision_encoder, "patch_size", None) or 16
         pool_size = getattr(vision_encoder, "pool_size", None)
         return {
             "max_images_per_prompt": max_images,

@@ -433,15 +433,12 @@ def _build_prefill_inputs(plan):
             max_images = vision_cfg["max_images_per_prompt"]
             num_vision_tokens = vision_cfg["num_vision_tokens"]
             if plan.separate_vision_encoder:
-                tokens_per_image = (
-                    num_vision_tokens // max_images if max_images else 1
-                )
                 base.update(
                     {
                         "mm_embedding": torch.zeros(
                             (
                                 max_images,
-                                tokens_per_image,
+                                plan.tokens_per_image,
                                 plan.vision_output_dim,
                             ),
                             dtype=plan.dtype,
@@ -460,7 +457,7 @@ def _build_prefill_inputs(plan):
                     _build_gemma4_vision_sample_inputs(
                         batch_size=1,
                         max_images=max_images,
-                        patch_size=vision_cfg.get("patch_size", 16),
+                        patch_size=vision_cfg["patch_size"],
                         image_size=vision_cfg["image_size"],
                         num_vision_tokens=num_vision_tokens,
                         seq_len=seq_len,
@@ -493,9 +490,7 @@ def _build_prefill_inputs(plan):
                     num_frames=audio_cfg["num_frames"],
                     num_audio_tokens=audio_cfg["num_audio_tokens"],
                     seq_len=seq_len,
-                    audio_input_feat_size=audio_cfg.get(
-                        "audio_input_feat_size", 128
-                    ),
+                    audio_input_feat_size=audio_cfg["audio_input_feat_size"],
                     dtype=plan.dtype,
                 )
             )
@@ -633,7 +628,7 @@ def _trace_and_convert(
         # Optionally export the vision encoder and adapter as separate models.
         if plan.separate_vision_encoder and plan.has_vision:
             vision_cfg = plan.vision_cfg
-            patch_size = vision_cfg.get("patch_size", 16)
+            patch_size = vision_cfg["patch_size"]
             vision_encoder_inputs = _build_vision_encoder_sample_inputs(
                 batch_size=1,
                 max_images=plan.max_images,
