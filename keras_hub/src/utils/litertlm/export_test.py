@@ -745,7 +745,7 @@ class TestLiteRTLmExport(TestCase):
         # -> prefill/decode TFLite signatures and compare against the Keras
         # eager reference (which runs the vision encoder inline and feeds
         # img_embeddings directly), the same comparison
-        # test_export_multimodal_outputs_match_keras does for the combined
+        # test_multimodal_numeric_parity_gemma3 does for the combined
         # (non-separate) vision-encoder path.
         interpreters_by_sig = {}
         for interpreter in interpreters:
@@ -974,129 +974,6 @@ class TestLiteRTLmExport(TestCase):
             eoi_out,
             atol=1e-5,
             rtol=1e-5,
-        )
-
-    def test_export_multimodal_outputs_match_keras(self):
-        """Verify multimodal Keras eager and TFLite outputs match."""
-        model = self._build_tiny_gemma3_multimodal_model(
-            num_layers=2, max_images=2, random_weights=True
-        )
-        backbone = model.backbone
-        tokenizer = model.preprocessor.tokenizer
-
-        # Export
-        litertlm_path = os.path.join(
-            self.get_temp_dir(), "verify_multimodal.litertlm"
-        )
-        model.export(litertlm_path, format="litertlm", prefill_seq_len=20)
-
-        # Extract TFLite
-        interpreter = self._extract_litertlm_tflite_interpreters(litertlm_path)[
-            0
-        ]
-
-        B, T, L = 1, 20, 2
-        H = backbone.num_key_value_heads
-        D = backbone.head_dim
-        tokens_np = (
-            np.arange(1, 1 + T, dtype=np.int32).reshape(B, T)
-            % tokenizer.vocabulary_size()
-        )
-        cache_keras = np.zeros((B, L, 2, T, H, D), dtype=np.float32)
-
-        # Preprocess images to get vision inputs.
-        images_np = np.ones((B, 2, 16, 16, 3), dtype=np.float32)
-        vision_indices_np = np.array([[0, 1, 2, 3, 4, 5, 6, 7]], dtype=np.int32)
-        vision_mask_np = np.zeros((B, T), dtype=np.int32)
-        vision_mask_np[0, :8] = 1
-
-        # Run vision encoder for Keras reference.
-        with torch.no_grad():
-            img_embeddings = backbone.vision_encoder(
-                torch.from_numpy(images_np)
-            )
-
-        # Keras prefill
-        keras_logits, keras_cache = self._call_with_cache_no_grad(
-            model,
-            tokens_np,
-            cache_keras,
-            0,
-            img_embeddings=img_embeddings,
-            vision_mask=torch.from_numpy(vision_mask_np),
-            padding_mask=None,
-            vision_indices=torch.from_numpy(vision_indices_np),
-            cache_update_mask=None,
-        )
-
-        # TFLite prefill
-        prefill_runner = interpreter.get_signature_runner("prefill")
-        prefill_inputs = {
-            "tokens": tokens_np,
-            "input_pos": np.arange(T, dtype=np.int32),
-            "images": images_np,
-            "vision_indices": vision_indices_np,
-            "vision_mask": vision_mask_np,
-        }
-        for i in range(L):
-            prefill_inputs[f"kv_cache_k_{i}"] = cache_keras[:, i, 0, ...]
-            prefill_inputs[f"kv_cache_v_{i}"] = cache_keras[:, i, 1, ...]
-        tflite_prefill_out = prefill_runner(**prefill_inputs)
-
-        # Compare prefill KV caches. Measured max abs diff on this tiny
-        # random-init model is ~1e-6 (see git history for the measurement);
-        # 1e-4 (matching the plain text-only parity test) leaves ~100x
-        # margin while still catching real regressions.
-        self._assert_kv_cache_close(
-            keras_cache, tflite_prefill_out, atol=1e-4, rtol=1e-4
-        )
-
-        # Keras decode at position 3 (no images needed)
-        decode_pos = 3
-        decode_token = tokens_np[:, decode_pos : decode_pos + 1].copy()
-        keras_logits_dec, keras_cache_dec = self._call_with_cache_no_grad(
-            model,
-            decode_token,
-            keras_cache,
-            decode_pos,
-            img_embeddings=None,
-            vision_mask=None,
-            padding_mask=None,
-            vision_indices=None,
-            cache_update_mask=None,
-        )
-
-        # TFLite decode
-        decode_runner = interpreter.get_signature_runner("decode")
-        decode_inputs = {
-            "tokens": decode_token,
-            "input_pos": np.array([decode_pos], dtype=np.int32),
-        }
-        for i in range(L):
-            decode_inputs[f"kv_cache_k_{i}"] = tflite_prefill_out[
-                f"kv_cache_k_{i}"
-            ]
-            decode_inputs[f"kv_cache_v_{i}"] = tflite_prefill_out[
-                f"kv_cache_v_{i}"
-            ]
-        tflite_dec_out = decode_runner(**decode_inputs)
-
-        # Compare decode logits. This was previously atol=rtol=5e-2 with a
-        # comment claiming vision-conditioned activations amplify small
-        # attention-algorithm differences enough to require it; measured
-        # directly, the actual max abs diff on this tiny random-init model is
-        # ~1e-6, so 1e-4 (matching the plain text-only parity test) is well
-        # justified and catches regressions 500x smaller than before.
-        self.assertAllClose(
-            keras_logits_dec,
-            tflite_dec_out["logits"],
-            atol=1e-4,
-            rtol=1e-4,
-        )
-
-        # Compare decode KV caches (same measured margin as above).
-        self._assert_kv_cache_close(
-            keras_cache_dec, tflite_dec_out, atol=1e-4, rtol=1e-4
         )
 
     def test_export_gpt2_with_auto_hf_tokenizer(self):
