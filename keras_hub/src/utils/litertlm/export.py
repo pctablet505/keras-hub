@@ -1598,22 +1598,17 @@ def _build_llm_metadata(
 
 def _torch_dtype_from_model(model):
     """Return a ``torch.dtype`` matching the model's compute dtype."""
+    from keras.src.backend.torch import core as torch_core
+
     compute_dtype = getattr(model, "compute_dtype", None)
     if compute_dtype is None:
         compute_dtype = getattr(model.backbone, "compute_dtype", "float32")
-    # compute_dtype may be a string, a Keras DTypePolicy, or a torch dtype.
+    # Unwrap DTypePolicy first (`to_torch_dtype` only accepts hashable
+    # dtypes); it then standardizes strings/torch dtypes and raises
+    # ValueError on anything unknown.
     if hasattr(compute_dtype, "name"):
         compute_dtype = compute_dtype.name
-    elif hasattr(compute_dtype, "value"):
-        compute_dtype = compute_dtype.value
-    elif isinstance(compute_dtype, torch.dtype):
-        return compute_dtype
-    torch_dtype = getattr(torch, compute_dtype, None)
-    if torch_dtype is None:
-        raise ValueError(
-            f"Unsupported compute_dtype for LiteRT-LM export: "
-            f"{compute_dtype!r}. Expected a PyTorch dtype string."
-        )
+    torch_dtype = torch_core.to_torch_dtype(compute_dtype)
     if torch_dtype is torch.bfloat16:
         warnings.warn(
             "Exporting with `compute_dtype=bfloat16`. BF16 LiteRT-LM export "
