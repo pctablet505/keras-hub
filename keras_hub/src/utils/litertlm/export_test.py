@@ -1,7 +1,6 @@
 import importlib.util
 import json
 import os
-import tempfile
 import types
 import unittest
 import unittest.mock
@@ -38,7 +37,7 @@ from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.litertlm import export
 from keras_hub.src.utils.litertlm.adapter import _cpu_default_device_scope
 from keras_hub.src.utils.litertlm.hf_tokenizer_converter import (
-    convert_byte_pair_to_hf,
+    materialize_hf_tokenizer_json,
 )
 
 _LITERT_TORCH_AVAILABLE = importlib.util.find_spec("litert_torch") is not None
@@ -1708,13 +1707,9 @@ class TestBytePairToHFTokenizer(TestCase):
         merges = ["a b"]
         tokenizer = GPT2Tokenizer(vocabulary=vocab, merges=merges)
 
-        hf_dict = convert_byte_pair_to_hf(tokenizer)
-        with tempfile.NamedTemporaryFile(
-            suffix=".json", delete=False, mode="w", encoding="utf-8"
-        ) as f:
-            json.dump(hf_dict, f, ensure_ascii=False, indent=2)
-            hf_tokenizer_path = f.name
-
+        hf_tokenizer_path = materialize_hf_tokenizer_json(
+            tokenizer, self.get_temp_dir()
+        )
         hf_tokenizer = tokenizers.Tokenizer.from_file(hf_tokenizer_path)
 
         for text in [

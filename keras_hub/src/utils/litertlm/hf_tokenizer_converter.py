@@ -15,7 +15,6 @@ object built elsewhere); the library is used directly only in tests, to
 validate the output.
 """
 
-import json
 import os
 
 from keras_hub.src.tokenizers.byte_pair_tokenizer import BytePairTokenizer
@@ -25,7 +24,8 @@ def _validate_and_ensure_initialized(tokenizer, caller_name):
     """Validate ``tokenizer`` is a ``BytePairTokenizer`` and is initialized.
 
     This helper centralizes the isinstance guard and the private
-    ``_maybe_initialized_tokenizers`` call used by the converter routines.
+    ``_maybe_initialized_tokenizers`` call used by
+    ``materialize_hf_tokenizer_json``.
     It relies on the private ``BytePairTokenizer._tokenizer`` attribute and
     its ``_maybe_initialized_tokenizers`` method; renaming either in
     ``BytePairTokenizer`` will require updating this helper.
@@ -36,22 +36,6 @@ def _validate_and_ensure_initialized(tokenizer, caller_name):
             f"Received: {type(tokenizer).__name__}."
         )
     tokenizer._maybe_initialized_tokenizers()
-
-
-def convert_byte_pair_to_hf(tokenizer):
-    """Convert any KerasHub BytePairTokenizer subclass to HF tokenizer.json.
-
-    Args:
-        tokenizer: A
-            ``keras_hub.src.tokenizers.byte_pair_tokenizer.BytePairTokenizer``
-            instance.
-
-    Returns:
-        dict: A ``tokenizer.json``-compatible dictionary that can be written to
-        disk and loaded with ``tokenizers.Tokenizer.from_file(path)``.
-    """
-    _validate_and_ensure_initialized(tokenizer, "convert_byte_pair_to_hf")
-    return json.loads(tokenizer._tokenizer.to_str())
 
 
 def materialize_hf_tokenizer_json(tokenizer, temp_dir):
