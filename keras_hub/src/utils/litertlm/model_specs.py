@@ -386,6 +386,16 @@ class LiteRTLMExportSpec:
         """
         return (batch_size, cache_length, num_kv_heads, head_dim)
 
+    def check_exportable(self, model):
+        """Raise ``ValueError`` if *model* is not exportable at all.
+
+        Called by ``export_to_litertlm`` immediately after spec resolution,
+        before any argument validation or tracing. Default no-op: every
+        registered family is exportable. Non-exportable models (see
+        ``Gemma4AssistantSpec``) override this to fail fast with a
+        family-specific explanation.
+        """
+
     def describe_unsupported_cache_structure(self):
         """Explain why ``cache_structure`` isn't ``"single_stacked"``.
 
@@ -1028,6 +1038,32 @@ class Gemma4Spec(GemmaSpec):
         )
 
 
+class Gemma4AssistantSpec(LiteRTLMExportSpec):
+    """The Gemma4 MTP draft (assistant) model: not standalone-exportable.
+
+    ``Gemma4AssistantCausalLM`` is a multi-token-prediction (MTP) draft
+    model for speculative decoding: its ``call_with_cache()`` requires a
+    target model's hidden state, last-token embedding, and borrowed KV
+    cache, so it has no self-contained prefill/decode graph to export. It
+    subclasses ``CausalLM`` directly (not ``Gemma4CausalLM``), so without
+    its own registry entry it would fall through to the generic spec and
+    crash deep in tracing. See the ``Gemma4AssistantCausalLM`` docstring
+    ("This model must NOT be used standalone").
+    """
+
+    def check_exportable(self, model):
+        raise ValueError(
+            f"LiteRT-LM export does not support `{type(model).__name__}`: it "
+            "is a multi-token-prediction (MTP) draft model for speculative "
+            "decoding, not a standalone model. Its `call_with_cache()` "
+            "depends on a target model's hidden state, last-token embedding, "
+            "and borrowed KV cache, so it cannot be exported on its own. "
+            "Export the target `Gemma4CausalLM` instead; the runtime uses "
+            "the draft model via `target_model.generate(..., "
+            "assistant_model=...)`."
+        )
+
+
 class PaliGemmaSpec(GemmaSpec):
     """PaliGemma has no dedicated ``LlmModelType`` vision subtype today.
 
@@ -1205,6 +1241,14 @@ _EXPORT_SPEC_REGISTRY = (
         "keras_hub.src.models.gemma4.gemma4_causal_lm",
         "Gemma4CausalLM",
         Gemma4Spec,
+    ),
+    # MTP draft model (subclasses `CausalLM` directly, not `Gemma4CausalLM`),
+    # not standalone-exportable: registered so `check_exportable` fails fast
+    # instead of falling through to the generic spec.
+    (
+        "keras_hub.src.models.gemma4.gemma4_assistant_causal_lm",
+        "Gemma4AssistantCausalLM",
+        Gemma4AssistantSpec,
     ),
     (
         "keras_hub.src.models.gemma3n.gemma3n_causal_lm",

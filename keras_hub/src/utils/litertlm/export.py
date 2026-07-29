@@ -987,31 +987,15 @@ def export_to_litertlm(
             installed.
     """
     path = os.fspath(path)
-    # Fail fast on MTP draft models, which are not standalone-exportable.
-    # `Gemma4AssistantCausalLM` is a multi-token-prediction (MTP) draft model
-    # for speculative decoding: its `call_with_cache()` requires a target
-    # model's hidden state, last-token embedding, and borrowed KV cache, so it
-    # has no self-contained prefill/decode graph to export. It subclasses
-    # `CausalLM` directly (not `Gemma4CausalLM`), so `resolve_export_spec`
-    # would otherwise silently fall through to the generic spec and crash deep
-    # in tracing. Reject it here, before tokenizer/backend checks, with a
-    # clear message. See `Gemma4AssistantCausalLM` docstring ("This model must
-    # NOT be used standalone").
-    from keras_hub.src.models.gemma4.gemma4_assistant_causal_lm import (
-        Gemma4AssistantCausalLM,
-    )
-
-    if isinstance(model, Gemma4AssistantCausalLM):
-        raise ValueError(
-            f"LiteRT-LM export does not support `{type(model).__name__}`: it "
-            "is a multi-token-prediction (MTP) draft model for speculative "
-            "decoding, not a standalone model. Its `call_with_cache()` "
-            "depends on a target model's hidden state, last-token embedding, "
-            "and borrowed KV cache, so it cannot be exported on its own. "
-            "Export the target `Gemma4CausalLM` instead; the runtime uses "
-            "the draft model via `target_model.generate(..., "
-            "assistant_model=...)`."
-        )
+    # Resolve the model-family export spec once and thread it through the
+    # rest of the pipeline (and into the adapter), instead of re-deriving
+    # family checks at each site. `llm_model_type`, when given, is an explicit
+    # caller override for presets indistinguishable from another family by
+    # class (e.g. `function_gemma`, a plain `Gemma3CausalLM`). Resolving up
+    # front also lets non-exportable models fail fast via
+    # `LiteRTLMExportSpec.check_exportable`, before any other validation.
+    spec = resolve_export_spec(model, llm_model_type=llm_model_type)
+    spec.check_exportable(model)
     if sampler_config is not None and not isinstance(
         sampler_config, SamplerConfig
     ):
@@ -1042,13 +1026,6 @@ def export_to_litertlm(
     from keras_hub.src.utils.litertlm.adapter import _cpu_default_device_scope
     from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
 
-    # Resolve the model-family export spec once and thread it through the
-    # rest of the pipeline (and into the adapter), instead of re-deriving
-    # family checks at each site. `llm_model_type`, when given, is an explicit
-    # caller override for presets indistinguishable from another family by
-    # class (e.g. `function_gemma`, a plain `Gemma3CausalLM`).
-    spec = resolve_export_spec(model, llm_model_type=llm_model_type)
-
     # Fail fast on model families whose cache structure the adapter cannot
     # build. Every currently-supported family uses a single stacked KV-cache
     # tensor ("single_stacked"); see `LiteRTLMExportSpec.cache_structure` and
@@ -1056,9 +1033,9 @@ def export_to_litertlm(
     # mismatch (e.g. Qwen3.5's hybrid cache) looks like and how to explain
     # it -- this generic check/message applies to any such family, not just
     # Qwen3.5, so a family-specific explanation belongs on that family's own
-    # spec class, not as a growing set of branches here. Checking this here,
-    # right after the spec is resolved and before any cache-config
-    # derivation or tracing, turns what used to be a cryptic `IndexError`
+    # spec class, not as a growing set of branches here. Checking this before
+    # any cache-config derivation or tracing turns what used to be a cryptic
+    # `IndexError`
     # deep inside `LiteRTLMExportSpec.stack_kv_cache` into a clear,
     # documented error raised before any expensive work happens.
     if spec.cache_structure != "single_stacked":
