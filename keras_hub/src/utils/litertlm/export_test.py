@@ -51,6 +51,36 @@ except ImportError:
     tokenizers = None
 
 
+# Content tokens shared by the tiny BPE vocabs in the HF-tokenizer
+# export/roundtrip tests. Tokenizer assertions are exact-id oracles, so
+# this token order is fixed.
+_TINY_BPE_CONTENT_TOKENS = [
+    "h",
+    "i",
+    "Ġ",
+    "Ġh",
+    "e",
+    "l",
+    "o",
+    "w",
+    "r",
+    "d",
+    "t",
+    "s",
+    "a",
+    "b",
+    "ab",
+]
+
+
+def _tiny_bpe_vocab(special_tokens, extra_tokens=("n", "k", "u", "m")):
+    """Tiny BPE vocab: per-family special tokens, then shared content."""
+    tokens = (
+        list(special_tokens) + _TINY_BPE_CONTENT_TOKENS + list(extra_tokens)
+    )
+    return {token: token_id for token_id, token in enumerate(tokens)}
+
+
 @unittest.skipUnless(
     keras.config.backend() == "torch",
     "LiteRT-LM export requires the PyTorch backend.",
@@ -94,6 +124,35 @@ class TestLiteRTLmExport(TestCase):
         for i in range(len(weights)):
             weights[i] = rng.random(weights[i].shape).astype(weights[i].dtype)
         model.set_weights(weights)
+
+    def _assert_kv_cache_close(self, keras_cache, tflite_out, atol, rtol):
+        """Per-layer K/V parity between a Keras cache and TFLite outputs."""
+        for i in range(keras_cache.shape[1]):
+            self.assertAllClose(
+                keras_cache[:, i, 0, ...],
+                tflite_out[f"kv_cache_k_{i}"],
+                atol=atol,
+                rtol=rtol,
+            )
+            self.assertAllClose(
+                keras_cache[:, i, 1, ...],
+                tflite_out[f"kv_cache_v_{i}"],
+                atol=atol,
+                rtol=rtol,
+            )
+
+    def _call_with_cache_no_grad(
+        self, model, tokens, cache, start_index, **kwargs
+    ):
+        """Eager `call_with_cache` under `no_grad`; numpy in, numpy out."""
+        with torch.no_grad():
+            logits, _, cache = model.call_with_cache(
+                torch.from_numpy(tokens),
+                torch.from_numpy(cache),
+                start_index,
+                **kwargs,
+            )
+        return logits.detach().cpu().numpy(), cache.detach().cpu().numpy()
 
     def test_export_tiny_gemma(self):
         path = os.path.join(self.get_temp_dir(), "test.litertlm")
@@ -234,14 +293,9 @@ class TestLiteRTLmExport(TestCase):
         cache_keras = np.zeros((B, L, 2, T, H, D), dtype=np.float32)
 
         # Keras prefill
-        with torch.no_grad():
-            keras_logits, _, keras_cache = self.model.call_with_cache(
-                torch.from_numpy(tokens_np),
-                torch.from_numpy(cache_keras),
-                0,
-            )
-        keras_logits = keras_logits.detach().cpu().numpy()
-        keras_cache = keras_cache.detach().cpu().numpy()
+        keras_logits, keras_cache = self._call_with_cache_no_grad(
+            self.model, tokens_np, cache_keras, 0
+        )
 
         # TFLite prefill
         prefill_runner = interpreter.get_signature_runner("prefill")
@@ -258,31 +312,16 @@ class TestLiteRTLmExport(TestCase):
         # Logits are verified via the decode step below.
 
         # Compare prefill KV caches
-        for i in range(L):
-            self.assertAllClose(
-                keras_cache[:, i, 0, ...],
-                tflite_prefill_out[f"kv_cache_k_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
-            self.assertAllClose(
-                keras_cache[:, i, 1, ...],
-                tflite_prefill_out[f"kv_cache_v_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
+        self._assert_kv_cache_close(
+            keras_cache, tflite_prefill_out, atol=1e-4, rtol=1e-4
+        )
 
         # Keras decode at position 3
         decode_pos = 3
         decode_token = tokens_np[:, decode_pos : decode_pos + 1].copy()
-        with torch.no_grad():
-            keras_logits_dec, _, keras_cache_dec = self.model.call_with_cache(
-                torch.from_numpy(decode_token),
-                torch.from_numpy(keras_cache),
-                decode_pos,
-            )
-        keras_logits_dec = keras_logits_dec.detach().cpu().numpy()
-        keras_cache_dec = keras_cache_dec.detach().cpu().numpy()
+        keras_logits_dec, keras_cache_dec = self._call_with_cache_no_grad(
+            self.model, decode_token, keras_cache, decode_pos
+        )
 
         # TFLite decode
         decode_runner = interpreter.get_signature_runner("decode")
@@ -308,19 +347,9 @@ class TestLiteRTLmExport(TestCase):
         )
 
         # Compare decode KV caches
-        for i in range(L):
-            self.assertAllClose(
-                keras_cache_dec[:, i, 0, ...],
-                tflite_dec_out[f"kv_cache_k_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
-            self.assertAllClose(
-                keras_cache_dec[:, i, 1, ...],
-                tflite_dec_out[f"kv_cache_v_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
+        self._assert_kv_cache_close(
+            keras_cache_dec, tflite_dec_out, atol=1e-4, rtol=1e-4
+        )
 
     def test_export_with_backend_constraint(self):
         """Verify export with valid backend_constraints succeeds."""
@@ -400,11 +429,17 @@ class TestLiteRTLmExport(TestCase):
                 backend_constraint="invalid_backend",
             )
 
-    def _build_tiny_gemma3_multimodal_model(self):
-        """Build a minimal Gemma3 vision-capable model for bucketing-ban
-        tests. Shared by `test_export_multimodal_bucketing_raises` and
-        `test_export_multimodal_bucketing_error_is_family_wide` -- both only
-        need the rejection to fire, not any particular model content."""
+    def _build_tiny_gemma3_multimodal_model(
+        self, num_layers=1, max_images=1, random_weights=False
+    ):
+        """Build a minimal Gemma3 vision-capable model.
+
+        The defaults serve the bucketing-ban tests, which only need the
+        rejection to fire, not any particular model content; the
+        structural/numeric multimodal tests pass `num_layers=2,
+        max_images=2, random_weights=True`. The mock tokenizer gets a
+        SentencePiece asset because the export raises without one.
+        """
         from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
         from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
         from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
@@ -431,14 +466,14 @@ class TestLiteRTLmExport(TestCase):
             image_converter=image_converter,
             tokenizer=tokenizer,
             sequence_length=20,
-            max_images_per_prompt=1,
+            max_images_per_prompt=max_images,
             num_vision_tokens_per_image=4,
         )
         vision_encoder = Gemma3VisionEncoder(
             image_size=16,
             patch_size=4,
             pool_size=2,
-            num_layers=1,
+            num_layers=num_layers,
             num_heads=2,
             hidden_dim=8,
             intermediate_dim=16,
@@ -447,7 +482,7 @@ class TestLiteRTLmExport(TestCase):
         backbone = Gemma3Backbone(
             vocabulary_size=tokenizer.vocabulary_size(),
             image_size=16,
-            num_layers=1,
+            num_layers=num_layers,
             num_query_heads=2,
             num_key_value_heads=1,
             hidden_dim=8,
@@ -455,7 +490,10 @@ class TestLiteRTLmExport(TestCase):
             head_dim=4,
             vision_encoder=vision_encoder,
         )
-        return Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
+        model = Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
+        if random_weights:
+            self._set_random_weights(model)
+        return model
 
     def test_export_multimodal_bucketing_raises(self):
         """Verify multimodal export rejects mismatched prefill_seq_len."""
@@ -596,58 +634,9 @@ class TestLiteRTLmExport(TestCase):
 
     def test_export_multimodal_tiny_gemma3(self):
         """Export a tiny Gemma3 vision+text model and verify structure."""
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
-            Gemma3CausalLMPreprocessor,
+        model = self._build_tiny_gemma3_multimodal_model(
+            num_layers=2, max_images=2, random_weights=True
         )
-        from keras_hub.src.models.gemma3.gemma3_image_converter import (
-            Gemma3ImageConverter,
-        )
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import (
-            MockGemma3Tokenizer,
-        )
-
-        tokenizer = MockGemma3Tokenizer()
-        self._attach_sentencepiece_tokenizer_asset(
-            tokenizer,
-            os.path.join(self.get_test_data_dir(), "gemma_test_vocab.spm"),
-        )
-
-        image_converter = Gemma3ImageConverter(image_size=(16, 16))
-        preprocessor = Gemma3CausalLMPreprocessor(
-            image_converter=image_converter,
-            tokenizer=tokenizer,
-            sequence_length=20,
-            max_images_per_prompt=2,
-            num_vision_tokens_per_image=4,
-        )
-        vision_encoder = Gemma3VisionEncoder(
-            image_size=16,
-            patch_size=4,
-            pool_size=2,
-            num_layers=2,
-            num_heads=2,
-            hidden_dim=8,
-            intermediate_dim=16,
-            output_dim=8,
-        )
-        backbone = Gemma3Backbone(
-            vocabulary_size=tokenizer.vocabulary_size(),
-            image_size=16,
-            num_layers=2,
-            num_query_heads=2,
-            num_key_value_heads=1,
-            hidden_dim=8,
-            intermediate_dim=16,
-            head_dim=4,
-            vision_encoder=vision_encoder,
-        )
-        model = Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
-        self._set_random_weights(model)
 
         path = os.path.join(self.get_temp_dir(), "test_multimodal.litertlm")
         model.export(path, format="litertlm", prefill_seq_len=20)
@@ -676,62 +665,11 @@ class TestLiteRTLmExport(TestCase):
         baked-in vision parity is already proven elsewhere; the tolerance is
         1e-4 (Gemma3's proven value), not relaxed.
         """
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
-            Gemma3CausalLMPreprocessor,
-        )
-        from keras_hub.src.models.gemma3.gemma3_image_converter import (
-            Gemma3ImageConverter,
-        )
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import (
-            MockGemma3Tokenizer,
-        )
-
-        tokenizer = MockGemma3Tokenizer()
-        # Without a tokenizer asset the export raises; attach one exactly as
-        # the sibling `test_export_multimodal_tiny_gemma3` does.
-        self._attach_sentencepiece_tokenizer_asset(
-            tokenizer,
-            os.path.join(self.get_test_data_dir(), "gemma_test_vocab.spm"),
-        )
-
-        image_converter = Gemma3ImageConverter(image_size=(16, 16))
-        preprocessor = Gemma3CausalLMPreprocessor(
-            image_converter=image_converter,
-            tokenizer=tokenizer,
-            sequence_length=20,
-            max_images_per_prompt=2,
-            num_vision_tokens_per_image=4,
-        )
-        vision_encoder = Gemma3VisionEncoder(
-            image_size=16,
-            patch_size=4,
-            pool_size=2,
-            num_layers=2,
-            num_heads=2,
-            hidden_dim=8,
-            intermediate_dim=16,
-            output_dim=8,
-        )
-        backbone = Gemma3Backbone(
-            vocabulary_size=tokenizer.vocabulary_size(),
-            image_size=16,
-            num_layers=2,
-            num_query_heads=2,
-            num_key_value_heads=1,
-            hidden_dim=8,
-            intermediate_dim=16,
-            head_dim=4,
-            vision_encoder=vision_encoder,
-        )
-        model = Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
         # Random (not default) weights so the parity check is meaningful --
         # otherwise both backends would compute on identical default values.
-        self._set_random_weights(model)
+        model = self._build_tiny_gemma3_multimodal_model(
+            num_layers=2, max_images=2, random_weights=True
+        )
 
         prefill_seq_len = 20
         path = os.path.join(self.get_temp_dir(), "test_mm_parity.litertlm")
@@ -763,58 +701,11 @@ class TestLiteRTLmExport(TestCase):
 
     def test_export_separate_vision_encoder_gemma3(self):
         """Export Gemma3 with separate vision encoder/adapter models."""
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
-            Gemma3CausalLMPreprocessor,
+        model = self._build_tiny_gemma3_multimodal_model(
+            num_layers=2, max_images=2, random_weights=True
         )
-        from keras_hub.src.models.gemma3.gemma3_image_converter import (
-            Gemma3ImageConverter,
-        )
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import (
-            MockGemma3Tokenizer,
-        )
-
-        tokenizer = MockGemma3Tokenizer()
-        self._attach_sentencepiece_tokenizer_asset(
-            tokenizer,
-            os.path.join(self.get_test_data_dir(), "gemma_test_vocab.spm"),
-        )
-
-        image_converter = Gemma3ImageConverter(image_size=(16, 16))
-        preprocessor = Gemma3CausalLMPreprocessor(
-            image_converter=image_converter,
-            tokenizer=tokenizer,
-            sequence_length=20,
-            max_images_per_prompt=2,
-            num_vision_tokens_per_image=4,
-        )
-        vision_encoder = Gemma3VisionEncoder(
-            image_size=16,
-            patch_size=4,
-            pool_size=2,
-            num_layers=2,
-            num_heads=2,
-            hidden_dim=8,
-            intermediate_dim=16,
-            output_dim=8,
-        )
-        backbone = Gemma3Backbone(
-            vocabulary_size=tokenizer.vocabulary_size(),
-            image_size=16,
-            num_layers=2,
-            num_query_heads=2,
-            num_key_value_heads=1,
-            hidden_dim=8,
-            intermediate_dim=16,
-            head_dim=4,
-            vision_encoder=vision_encoder,
-        )
-        model = Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
-        self._set_random_weights(model)
+        backbone = model.backbone
+        tokenizer = model.preprocessor.tokenizer
 
         path = os.path.join(
             self.get_temp_dir(), "test_separate_vision.litertlm"
@@ -880,21 +771,21 @@ class TestLiteRTLmExport(TestCase):
         # Keras reference: run the vision encoder inline, exactly as the
         # combined (non-separate) path does.
         with torch.no_grad():
-            keras_img_embeddings = backbone.vision_encoder(
+            img_embeddings = backbone.vision_encoder(
                 torch.from_numpy(images_np)
             )
-            keras_logits, _, keras_cache = model.call_with_cache(
-                torch.from_numpy(tokens_np),
-                torch.from_numpy(cache_keras),
-                0,
-                img_embeddings=keras_img_embeddings,
-                vision_mask=torch.from_numpy(vision_mask_np),
-                padding_mask=None,
-                vision_indices=torch.from_numpy(vision_indices_np),
-                cache_update_mask=None,
-            )
-        keras_img_embeddings = keras_img_embeddings.detach().cpu().numpy()
-        keras_cache = keras_cache.detach().cpu().numpy()
+        keras_img_embeddings = img_embeddings.detach().cpu().numpy()
+        _, keras_cache = self._call_with_cache_no_grad(
+            model,
+            tokens_np,
+            cache_keras,
+            0,
+            img_embeddings=img_embeddings,
+            vision_mask=torch.from_numpy(vision_mask_np),
+            padding_mask=None,
+            vision_indices=torch.from_numpy(vision_indices_np),
+            cache_update_mask=None,
+        )
 
         # TFLite: chain vision_encoder -> vision_adapter -> prefill.
         vision_encoder_runner = vision_encoder_interpreter.get_signature_runner(
@@ -961,19 +852,9 @@ class TestLiteRTLmExport(TestCase):
         # End-to-end parity: KV caches after prefilling through the full
         # separate vision_encoder -> vision_adapter -> prefill chain should
         # match the Keras eager reference.
-        for i in range(L):
-            self.assertAllClose(
-                keras_cache[:, i, 0, ...],
-                tflite_prefill_out[f"kv_cache_k_{i}"],
-                atol=1e-3,
-                rtol=1e-3,
-            )
-            self.assertAllClose(
-                keras_cache[:, i, 1, ...],
-                tflite_prefill_out[f"kv_cache_v_{i}"],
-                atol=1e-3,
-                rtol=1e-3,
-            )
+        self._assert_kv_cache_close(
+            keras_cache, tflite_prefill_out, atol=1e-3, rtol=1e-3
+        )
 
     def _litertlm_section_model_types(self, path):
         """Return the ``model_type`` string of every section in a bundle.
@@ -1030,58 +911,11 @@ class TestLiteRTLmExport(TestCase):
         `export_hf` module packing an optional ``eoi.tflite`` model (see
         `KerasHubEndOfImageAdapter` in ``adapter.py``).
         """
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
-            Gemma3CausalLMPreprocessor,
+        model = self._build_tiny_gemma3_multimodal_model(
+            num_layers=2, max_images=2, random_weights=True
         )
-        from keras_hub.src.models.gemma3.gemma3_image_converter import (
-            Gemma3ImageConverter,
-        )
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import (
-            MockGemma3Tokenizer,
-        )
-
-        tokenizer = MockGemma3Tokenizer()
-        self._attach_sentencepiece_tokenizer_asset(
-            tokenizer,
-            os.path.join(self.get_test_data_dir(), "gemma_test_vocab.spm"),
-        )
-
-        image_converter = Gemma3ImageConverter(image_size=(16, 16))
-        preprocessor = Gemma3CausalLMPreprocessor(
-            image_converter=image_converter,
-            tokenizer=tokenizer,
-            sequence_length=20,
-            max_images_per_prompt=2,
-            num_vision_tokens_per_image=4,
-        )
-        vision_encoder = Gemma3VisionEncoder(
-            image_size=16,
-            patch_size=4,
-            pool_size=2,
-            num_layers=2,
-            num_heads=2,
-            hidden_dim=8,
-            intermediate_dim=16,
-            output_dim=8,
-        )
-        backbone = Gemma3Backbone(
-            vocabulary_size=tokenizer.vocabulary_size(),
-            image_size=16,
-            num_layers=2,
-            num_query_heads=2,
-            num_key_value_heads=1,
-            hidden_dim=8,
-            intermediate_dim=16,
-            head_dim=4,
-            vision_encoder=vision_encoder,
-        )
-        model = Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
-        self._set_random_weights(model)
+        backbone = model.backbone
+        tokenizer = model.preprocessor.tokenizer
 
         path = os.path.join(
             self.get_temp_dir(), "test_separate_vision_eoi.litertlm"
@@ -1144,58 +978,11 @@ class TestLiteRTLmExport(TestCase):
 
     def test_export_multimodal_outputs_match_keras(self):
         """Verify multimodal Keras eager and TFLite outputs match."""
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
-            Gemma3CausalLMPreprocessor,
+        model = self._build_tiny_gemma3_multimodal_model(
+            num_layers=2, max_images=2, random_weights=True
         )
-        from keras_hub.src.models.gemma3.gemma3_image_converter import (
-            Gemma3ImageConverter,
-        )
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import (
-            MockGemma3Tokenizer,
-        )
-
-        tokenizer = MockGemma3Tokenizer()
-        self._attach_sentencepiece_tokenizer_asset(
-            tokenizer,
-            os.path.join(self.get_test_data_dir(), "gemma_test_vocab.spm"),
-        )
-
-        image_converter = Gemma3ImageConverter(image_size=(16, 16))
-        preprocessor = Gemma3CausalLMPreprocessor(
-            image_converter=image_converter,
-            tokenizer=tokenizer,
-            sequence_length=20,
-            max_images_per_prompt=2,
-            num_vision_tokens_per_image=4,
-        )
-        vision_encoder = Gemma3VisionEncoder(
-            image_size=16,
-            patch_size=4,
-            pool_size=2,
-            num_layers=2,
-            num_heads=2,
-            hidden_dim=8,
-            intermediate_dim=16,
-            output_dim=8,
-        )
-        backbone = Gemma3Backbone(
-            vocabulary_size=tokenizer.vocabulary_size(),
-            image_size=16,
-            num_layers=2,
-            num_query_heads=2,
-            num_key_value_heads=1,
-            hidden_dim=8,
-            intermediate_dim=16,
-            head_dim=4,
-            vision_encoder=vision_encoder,
-        )
-        model = Gemma3CausalLM(preprocessor=preprocessor, backbone=backbone)
-        self._set_random_weights(model)
+        backbone = model.backbone
+        tokenizer = model.preprocessor.tokenizer
 
         # Export
         litertlm_path = os.path.join(
@@ -1230,19 +1017,17 @@ class TestLiteRTLmExport(TestCase):
             )
 
         # Keras prefill
-        with torch.no_grad():
-            keras_logits, _, keras_cache = model.call_with_cache(
-                torch.from_numpy(tokens_np),
-                torch.from_numpy(cache_keras),
-                0,
-                img_embeddings=img_embeddings,
-                vision_mask=torch.from_numpy(vision_mask_np),
-                padding_mask=None,
-                vision_indices=torch.from_numpy(vision_indices_np),
-                cache_update_mask=None,
-            )
-        keras_logits = keras_logits.detach().cpu().numpy()
-        keras_cache = keras_cache.detach().cpu().numpy()
+        keras_logits, keras_cache = self._call_with_cache_no_grad(
+            model,
+            tokens_np,
+            cache_keras,
+            0,
+            img_embeddings=img_embeddings,
+            vision_mask=torch.from_numpy(vision_mask_np),
+            padding_mask=None,
+            vision_indices=torch.from_numpy(vision_indices_np),
+            cache_update_mask=None,
+        )
 
         # TFLite prefill
         prefill_runner = interpreter.get_signature_runner("prefill")
@@ -1262,36 +1047,24 @@ class TestLiteRTLmExport(TestCase):
         # random-init model is ~1e-6 (see git history for the measurement);
         # 1e-4 (matching the plain text-only parity test) leaves ~100x
         # margin while still catching real regressions.
-        for i in range(L):
-            self.assertAllClose(
-                keras_cache[:, i, 0, ...],
-                tflite_prefill_out[f"kv_cache_k_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
-            self.assertAllClose(
-                keras_cache[:, i, 1, ...],
-                tflite_prefill_out[f"kv_cache_v_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
+        self._assert_kv_cache_close(
+            keras_cache, tflite_prefill_out, atol=1e-4, rtol=1e-4
+        )
 
         # Keras decode at position 3 (no images needed)
         decode_pos = 3
         decode_token = tokens_np[:, decode_pos : decode_pos + 1].copy()
-        with torch.no_grad():
-            keras_logits_dec, _, keras_cache_dec = model.call_with_cache(
-                torch.from_numpy(decode_token),
-                torch.from_numpy(keras_cache),
-                decode_pos,
-                img_embeddings=None,
-                vision_mask=None,
-                padding_mask=None,
-                vision_indices=None,
-                cache_update_mask=None,
-            )
-        keras_logits_dec = keras_logits_dec.detach().cpu().numpy()
-        keras_cache_dec = keras_cache_dec.detach().cpu().numpy()
+        keras_logits_dec, keras_cache_dec = self._call_with_cache_no_grad(
+            model,
+            decode_token,
+            keras_cache,
+            decode_pos,
+            img_embeddings=None,
+            vision_mask=None,
+            padding_mask=None,
+            vision_indices=None,
+            cache_update_mask=None,
+        )
 
         # TFLite decode
         decode_runner = interpreter.get_signature_runner("decode")
@@ -1322,44 +1095,13 @@ class TestLiteRTLmExport(TestCase):
         )
 
         # Compare decode KV caches (same measured margin as above).
-        for i in range(L):
-            self.assertAllClose(
-                keras_cache_dec[:, i, 0, ...],
-                tflite_dec_out[f"kv_cache_k_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
-            self.assertAllClose(
-                keras_cache_dec[:, i, 1, ...],
-                tflite_dec_out[f"kv_cache_v_{i}"],
-                atol=1e-4,
-                rtol=1e-4,
-            )
+        self._assert_kv_cache_close(
+            keras_cache_dec, tflite_dec_out, atol=1e-4, rtol=1e-4
+        )
 
     def test_export_gpt2_with_auto_hf_tokenizer(self):
         """Export a tiny GPT2 model with auto-converted HF tokenizer."""
-        vocab = {
-            "<|endoftext|>": 0,
-            "h": 1,
-            "i": 2,
-            "Ġ": 3,
-            "Ġh": 4,
-            "e": 5,
-            "l": 6,
-            "o": 7,
-            "w": 8,
-            "r": 9,
-            "d": 10,
-            "t": 11,
-            "s": 12,
-            "a": 13,
-            "b": 14,
-            "ab": 15,
-            "n": 16,
-            "k": 17,
-            "u": 18,
-            "m": 19,
-        }
+        vocab = _tiny_bpe_vocab(["<|endoftext|>"])
         merges = ["a b"]
         tokenizer = GPT2Tokenizer(vocabulary=vocab, merges=merges)
 
@@ -1386,33 +1128,16 @@ class TestLiteRTLmExport(TestCase):
 
     def test_export_llama3_with_auto_hf_tokenizer(self):
         """Export a tiny Llama3 model with auto-converted HF tokenizer."""
-        vocab = {
-            "<|endoftext|>": 0,
-            "<|begin_of_text|>": 1,
-            "<|end_of_text|>": 2,
-            "<|start_header_id|>": 3,
-            "<|end_header_id|>": 4,
-            "<|eot_id|>": 5,
-            "h": 6,
-            "i": 7,
-            "Ġ": 8,
-            "Ġh": 9,
-            "e": 10,
-            "l": 11,
-            "o": 12,
-            "w": 13,
-            "r": 14,
-            "d": 15,
-            "t": 16,
-            "s": 17,
-            "a": 18,
-            "b": 19,
-            "ab": 20,
-            "n": 21,
-            "k": 22,
-            "u": 23,
-            "m": 24,
-        }
+        vocab = _tiny_bpe_vocab(
+            [
+                "<|endoftext|>",
+                "<|begin_of_text|>",
+                "<|end_of_text|>",
+                "<|start_header_id|>",
+                "<|end_header_id|>",
+                "<|eot_id|>",
+            ]
+        )
         merges = ["a b"]
         tokenizer = Llama3Tokenizer(vocabulary=vocab, merges=merges)
 
@@ -1455,29 +1180,7 @@ class TestLiteRTLmExport(TestCase):
 
     def test_export_qwen3_with_auto_hf_tokenizer(self):
         """Export a tiny Qwen3 model with auto-converted HF tokenizer."""
-        vocab = {
-            "<|endoftext|>": 0,
-            "<|im_end|>": 1,
-            "h": 2,
-            "i": 3,
-            "Ġ": 4,
-            "Ġh": 5,
-            "e": 6,
-            "l": 7,
-            "o": 8,
-            "w": 9,
-            "r": 10,
-            "d": 11,
-            "t": 12,
-            "s": 13,
-            "a": 14,
-            "b": 15,
-            "ab": 16,
-            "n": 17,
-            "k": 18,
-            "u": 19,
-            "m": 20,
-        }
+        vocab = _tiny_bpe_vocab(["<|endoftext|>", "<|im_end|>"])
         merges = ["a b"]
         tokenizer = Qwen3Tokenizer(vocabulary=vocab, merges=merges)
 
@@ -1684,26 +1387,9 @@ class TestBytePairToHFTokenizer(TestCase):
                 "BytePair tokenizer roundtrip requires torch backend."
             )
 
-        vocab = {
-            "<|endoftext|>": 0,
-            "h": 1,
-            "i": 2,
-            "Ġ": 3,
-            "Ġh": 4,
-            "e": 5,
-            "l": 6,
-            "o": 7,
-            "w": 8,
-            "r": 9,
-            "d": 10,
-            "t": 11,
-            "s": 12,
-            "a": 13,
-            "b": 14,
-            "ab": 15,
-            "hello": 16,
-            "Ġworld": 17,
-        }
+        vocab = _tiny_bpe_vocab(
+            ["<|endoftext|>"], extra_tokens=["hello", "Ġworld"]
+        )
         merges = ["a b"]
         tokenizer = GPT2Tokenizer(vocabulary=vocab, merges=merges)
 
