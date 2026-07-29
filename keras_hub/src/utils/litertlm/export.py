@@ -1496,7 +1496,7 @@ def _build_llm_metadata(
     # the metadata schema, so we import defensively and surface a clear error
     # if the internal layout changes.
     try:
-        from litert_lm_builder.litertlm_builder import llm_metadata_pb2
+        from litert_lm_builder.runtime.proto import llm_metadata_pb2
     except ImportError as e:
         raise ImportError(
             "LiteRT-LM export requires the metadata protobuf from "
