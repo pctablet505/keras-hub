@@ -343,7 +343,7 @@ def _validate_export_args(
             )
         _check_hf_tokenizer_vocab_compatible(hf_tokenizer_path, model)
     elif _is_sentencepiece_tokenizer(tokenizer):
-        _validate_sentencepiece_tokenizer(tokenizer)
+        pass
     elif isinstance(tokenizer, BytePairTokenizer):
         # Any BytePairTokenizer subclass can be converted to HF tokenizer.json.
         pass
@@ -1494,15 +1494,6 @@ def _is_sentencepiece_tokenizer(tokenizer):
         return True
     file_assets = set(getattr(tokenizer, "file_assets", []) or [])
     return "vocabulary.spm" in file_assets
-
-
-def _validate_sentencepiece_tokenizer(tokenizer):
-    file_assets = set(getattr(tokenizer, "file_assets", []) or [])
-    if "vocabulary.spm" not in file_assets:
-        raise ValueError(
-            "LiteRT-LM export currently supports SentencePiece tokenizers "
-            "only. Expected tokenizer assets to include `vocabulary.spm`."
-        )
 
 
 def _materialize_sentencepiece_tokenizer(tokenizer, temp_dir):
