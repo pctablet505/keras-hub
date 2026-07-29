@@ -1004,10 +1004,9 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
 
         if cache_layout == "gemma3n":
             keras_cache_shape = (B, L, 2, H, cache_length, D)
-            per_layer_shape = (B, H, cache_length, D)
         else:
             keras_cache_shape = (B, L, 2, cache_length, H, D)
-            per_layer_shape = (B, cache_length, H, D)
+        per_layer_shape = spec.get_kv_cache_sample_shape(B, cache_length, H, D)
 
         # Find the best prefill signature (bucketed or single).
         sig_list = list(interpreter._get_full_signature_list().keys())

@@ -20,26 +20,11 @@ import os
 from keras_hub.src.tokenizers.byte_pair_tokenizer import BytePairTokenizer
 
 
-def _validate_and_ensure_initialized(tokenizer, caller_name):
-    """Validate ``tokenizer`` is a ``BytePairTokenizer`` and is initialized.
-
-    This helper centralizes the isinstance guard and the private
-    ``_maybe_initialized_tokenizers`` call used by
-    ``materialize_hf_tokenizer_json``.
-    It relies on the private ``BytePairTokenizer._tokenizer`` attribute and
-    its ``_maybe_initialized_tokenizers`` method; renaming either in
-    ``BytePairTokenizer`` will require updating this helper.
-    """
-    if not isinstance(tokenizer, BytePairTokenizer):
-        raise TypeError(
-            f"`{caller_name}` expects a BytePairTokenizer instance. "
-            f"Received: {type(tokenizer).__name__}."
-        )
-    tokenizer._maybe_initialized_tokenizers()
-
-
 def materialize_hf_tokenizer_json(tokenizer, temp_dir):
     """Convert a KerasHub tokenizer and write ``tokenizer.json`` to disk.
+
+    Relies on the private ``BytePairTokenizer._tokenizer`` attribute and its
+    ``_maybe_initialized_tokenizers`` method.
 
     Args:
         tokenizer: A KerasHub ``BytePairTokenizer`` instance.
@@ -48,7 +33,12 @@ def materialize_hf_tokenizer_json(tokenizer, temp_dir):
     Returns:
         str: Path to the written ``tokenizer.json`` file.
     """
-    _validate_and_ensure_initialized(tokenizer, "materialize_hf_tokenizer_json")
+    if not isinstance(tokenizer, BytePairTokenizer):
+        raise TypeError(
+            "`materialize_hf_tokenizer_json` expects a BytePairTokenizer "
+            f"instance. Received: {type(tokenizer).__name__}."
+        )
+    tokenizer._maybe_initialized_tokenizers()
     tokenizer_path = os.path.join(temp_dir, "tokenizer.json")
     with open(tokenizer_path, "w", encoding="utf-8") as f:
         f.write(tokenizer._tokenizer.to_str())

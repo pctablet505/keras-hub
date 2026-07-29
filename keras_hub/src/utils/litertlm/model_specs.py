@@ -23,9 +23,7 @@ def _first_attr(obj, *names, default=None):
 
 def _get_vision_encoder(backbone):
     """Return the vision encoder from a backbone, or ``None``."""
-    return getattr(backbone, "vision_encoder", None) or getattr(
-        backbone, "vit_encoder", None
-    )
+    return _first_attr(backbone, "vision_encoder", "vit_encoder")
 
 
 # Special token strings used when populating vision/audio metadata.
