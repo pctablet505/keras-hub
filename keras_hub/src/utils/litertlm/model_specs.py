@@ -374,6 +374,18 @@ class LiteRTLMExportSpec:
             "used_preprocessor_fallback": used_preprocessor_fallback,
         }
 
+    def get_kv_cache_sample_shape(
+        self, batch_size, cache_length, num_kv_heads, head_dim
+    ):
+        """Return the per-layer KV-cache sample shape for this family.
+
+        Used by ``export.py``'s sample-input builder to size the flat
+        ``kv_cache_k_N``/``kv_cache_v_N`` trace inputs. Default: the
+        ``"standard"`` ``cache_layout`` shape, ``[batch, cache_length,
+        num_kv_heads, head_dim]``.
+        """
+        return (batch_size, cache_length, num_kv_heads, head_dim)
+
     def describe_unsupported_cache_structure(self):
         """Explain why ``cache_structure`` isn't ``"single_stacked"``.
 
@@ -903,6 +915,16 @@ class Gemma3nSpec(GemmaSpec):
     #: pack as a separate bundle section. See
     #: ``LiteRTLMExportSpec.supports_separate_vision``.
     supports_separate_vision = False
+
+    def get_kv_cache_sample_shape(
+        self, batch_size, cache_length, num_kv_heads, head_dim
+    ):
+        """Return Gemma3n's per-layer KV-cache sample shape.
+
+        Gemma3n's ``cache_layout`` transposes the standard shape to
+        ``[batch, num_kv_heads, cache_length, head_dim]``.
+        """
+        return (batch_size, num_kv_heads, cache_length, head_dim)
 
     def populate_audio_metadata(self, meta, audio_cfg):
         del audio_cfg

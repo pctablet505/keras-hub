@@ -430,7 +430,7 @@ def _build_prefill_inputs(plan):
             num_kv_heads=plan.num_kv_heads,
             head_dim=plan.head_dim,
             dtype=plan.dtype,
-            cache_layout=plan.cache_layout,
+            spec=plan.spec,
         )
         if plan.has_vision:
             vision_cfg = plan.vision_cfg
@@ -1219,7 +1219,7 @@ def export_to_litertlm(
             num_kv_heads=plan.num_kv_heads,
             head_dim=plan.head_dim,
             dtype=plan.dtype,
-            cache_layout=plan.cache_layout,
+            spec=plan.spec,
         )
 
         adapter = KerasHubLiteRTAdapter(
@@ -1298,14 +1298,13 @@ def _build_sample_inputs(
     num_kv_heads,
     head_dim,
     dtype,
-    cache_layout="standard",
+    spec,
 ):
     """Create concrete sample tensors for one signature.
 
-    ``cache_layout`` controls the per-layer KV-cache shape:
-
-    - ``"standard"``: ``[batch_size, cache_length, num_kv_heads, head_dim]``
-    - ``"gemma3n"``: ``[batch_size, num_kv_heads, cache_length, head_dim]``
+    The per-layer KV-cache sample shape is owned by the model family's
+    spec (``spec.get_kv_cache_sample_shape``; see ``cache_layout`` on
+    ``LiteRTLMExportSpec``).
     """
     device = "cpu"
     tokens = torch.zeros(
@@ -1315,10 +1314,9 @@ def _build_sample_inputs(
     if seq_len == 1:
         input_pos = torch.zeros((1,), dtype=torch.int32, device=device)
     kv_cache = {}
-    if cache_layout == "gemma3n":
-        shape = (batch_size, num_kv_heads, cache_length, head_dim)
-    else:
-        shape = (batch_size, cache_length, num_kv_heads, head_dim)
+    shape = spec.get_kv_cache_sample_shape(
+        batch_size, cache_length, num_kv_heads, head_dim
+    )
     for i in range(num_layers):
         kv_cache[f"kv_cache_k_{i}"] = torch.zeros(
             shape, dtype=dtype, device=device
