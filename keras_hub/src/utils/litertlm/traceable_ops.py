@@ -124,23 +124,7 @@ def _make_patched_slice():
     return _patched_slice
 
 
-@contextlib.contextmanager
-def _traceable_slice_scope():
-    """Temporarily patch Keras torch-backend ``slice`` for torch.export.
-
-    Keras ``ops.slice`` can introduce unbacked symbols during
-    ``torch.export.export`` for dynamic start/length values. This patch keeps
-    slicing traceable for the common single-dynamic-dimension case.
-
-    Uses ``unittest.mock.patch.object`` so restoration is reliable even when
-    an exception escapes.
-    """
-    with unittest.mock.patch.object(
-        torch_core,
-        "slice",
-        _make_patched_slice(),
-    ):
-        yield
+_traceable_slice_scope = _make_scope(torch_core, "slice", _make_patched_slice())
 
 
 def _traceable_dot_product_attention(
