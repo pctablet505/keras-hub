@@ -433,6 +433,9 @@ def _build_prefill_inputs(plan):
             max_images = vision_cfg["max_images_per_prompt"]
             num_vision_tokens = vision_cfg["num_vision_tokens"]
             if plan.separate_vision_encoder:
+                vision_indices, vision_mask = _build_indices_and_mask(
+                    1, num_vision_tokens, seq_len
+                )
                 base.update(
                     {
                         "mm_embedding": torch.zeros(
@@ -444,12 +447,8 @@ def _build_prefill_inputs(plan):
                             dtype=plan.dtype,
                             device="cpu",
                         ),
-                        "vision_indices": torch.zeros(
-                            (1, num_vision_tokens), dtype=torch.int32
-                        ),
-                        "vision_mask": torch.zeros(
-                            (1, seq_len), dtype=torch.int32
-                        ),
+                        "vision_indices": vision_indices,
+                        "vision_mask": vision_mask,
                     }
                 )
             elif plan.vision_input_style == "patch_values":
@@ -509,8 +508,7 @@ def _build_vision_encoder_sample_inputs(
     """Create concrete sample inputs for a separate vision-encoder signature."""
     device = "cpu"
     if vision_input_style == "patch_values":
-        num_patches = (image_size // patch_size) ** 2
-        patch_dim = patch_size**2 * 3
+        num_patches, patch_dim = _gemma4_patch_dims(image_size, patch_size)
         return {
             "pixel_values": torch.zeros(
                 (
@@ -1332,6 +1330,22 @@ def _build_sample_inputs(
     return sample
 
 
+def _build_indices_and_mask(batch_size, num_tokens, seq_len):
+    """Create the zeroed int32 ``(indices, mask)`` sample-tensor pair."""
+    indices = torch.zeros(
+        (batch_size, num_tokens), dtype=torch.int32, device="cpu"
+    )
+    mask = torch.zeros((batch_size, seq_len), dtype=torch.int32, device="cpu")
+    return indices, mask
+
+
+def _gemma4_patch_dims(image_size, patch_size):
+    """Return ``(num_patches, patch_dim)`` for Gemma4's flattened patches."""
+    num_patches = (image_size // patch_size) ** 2
+    patch_dim = patch_size**2 * 3
+    return num_patches, patch_dim
+
+
 def _build_vision_sample_inputs(
     batch_size,
     max_images,
@@ -1347,11 +1361,8 @@ def _build_vision_sample_inputs(
         dtype=dtype,
         device=device,
     )
-    vision_indices = torch.zeros(
-        (batch_size, num_vision_tokens), dtype=torch.int32, device=device
-    )
-    vision_mask = torch.zeros(
-        (batch_size, seq_len), dtype=torch.int32, device=device
+    vision_indices, vision_mask = _build_indices_and_mask(
+        batch_size, num_vision_tokens, seq_len
     )
     return {
         "images": images,
@@ -1375,8 +1386,7 @@ def _build_gemma4_vision_sample_inputs(
     (``pixel_values`` + ``pixel_position_ids``) rather than raw RGB images.
     """
     device = "cpu"
-    num_patches = (image_size // patch_size) ** 2
-    patch_dim = patch_size * patch_size * 3
+    num_patches, patch_dim = _gemma4_patch_dims(image_size, patch_size)
     pixel_values = torch.zeros(
         (batch_size, max_images, num_patches, patch_dim),
         dtype=dtype,
@@ -1387,11 +1397,8 @@ def _build_gemma4_vision_sample_inputs(
         dtype=torch.int32,
         device=device,
     )
-    vision_indices = torch.zeros(
-        (batch_size, num_vision_tokens), dtype=torch.int32, device=device
-    )
-    vision_mask = torch.zeros(
-        (batch_size, seq_len), dtype=torch.int32, device=device
+    vision_indices, vision_mask = _build_indices_and_mask(
+        batch_size, num_vision_tokens, seq_len
     )
     return {
         "pixel_values": pixel_values,
@@ -1420,11 +1427,8 @@ def _build_audio_sample_inputs(
     audio_mel_mask = torch.zeros(
         (batch_size, max_clips, num_frames), dtype=torch.int32, device=device
     )
-    audio_indices = torch.zeros(
-        (batch_size, num_audio_tokens), dtype=torch.int32, device=device
-    )
-    audio_mask = torch.zeros(
-        (batch_size, seq_len), dtype=torch.int32, device=device
+    audio_indices, audio_mask = _build_indices_and_mask(
+        batch_size, num_audio_tokens, seq_len
     )
     return {
         "audio_mel": audio_mel,
