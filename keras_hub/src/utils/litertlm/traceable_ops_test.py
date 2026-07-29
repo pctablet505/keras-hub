@@ -114,6 +114,19 @@ class TraceableOpsParityTest(TestCase):
         patched = traceable_ops._traceable_repeat(x, 3, axis=None)
         self.assertAllClose(_to_np(original), _to_np(patched))
 
+    def test_repeat_list_repeats_with_axis_delegates_to_original(self):
+        # Upstream `repeat` rejects a Python list `repeats` with ValueError;
+        # inside the patch scope the fallback must delegate to the captured
+        # original (mirroring that raise), not recurse into the patch.
+        from keras.src.backend.torch import numpy as torch_backend_numpy
+
+        x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+        with self.assertRaises(ValueError):
+            torch_backend_numpy.repeat(x, [1, 2], axis=0)
+        with traceable_ops._traceable_repeat_scope():
+            with self.assertRaises(ValueError):
+                torch_backend_numpy.repeat(x, [1, 2], axis=0)
+
     # ------------------------------------------------------------------
     # slice (via `_make_patched_slice`)
     # ------------------------------------------------------------------

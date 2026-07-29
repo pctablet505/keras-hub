@@ -376,14 +376,16 @@ def _is_scalar_integer(value):
     return False
 
 
-def _traceable_repeat(x, repeats, axis=None):
-    """Traceable replacement for Keras torch-backend ``numpy.repeat``.
+# Capture the original ``repeat`` at module load so the patch can delegate
+# to it for every input form outside the scalar-tensor intercept.
+_ORIGINAL_REPEAT = torch_backend_numpy.repeat
 
-    ``torch.repeat_interleave`` lowers to ``aten.repeat_interleave.Tensor``,
-    which ``litert_torch`` cannot translate to TFLite. For the common case of
-    repeating a tensor by a scalar integer along a single axis (e.g. GQA
-    key/value head repetition), this implementation uses
-    ``unsqueeze + expand + reshape``, which ``litert_torch`` handles.
+
+def _traceable_repeat(x, repeats, axis=None):
+    """Intercept 0-D tensor ``repeats`` (and ``repeats == 1``) with an axis.
+
+    Keras's own ``repeat`` fast-paths only plain Python ints; every other
+    input form defers to the original implementation unchanged.
     """
     x = torch_core.convert_to_tensor(x)
 
@@ -404,9 +406,7 @@ def _traceable_repeat(x, repeats, axis=None):
         new_shape[axis] = shape[axis] * repeats
         return x.reshape(new_shape)
 
-    # Fall back to the original implementation for list/tuple repeats or
-    # dynamic repeat counts.
-    return torch_backend_numpy.repeat(x, repeats, axis=axis)
+    return _ORIGINAL_REPEAT(x, repeats, axis=axis)
 
 
 _traceable_repeat_scope = _make_scope(
