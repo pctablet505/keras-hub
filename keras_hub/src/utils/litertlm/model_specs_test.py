@@ -467,9 +467,8 @@ class ExportSpecRegistryIntegrityTest(TestCase):
 
     def test_non_audio_specs_have_no_audio_input_style(self):
         """The base spec and non-audio families default to `None`, so the
-        registry test's audio-capability signal stays a clean non-None check
-        (mirrors `vision_input_style` being `None` only via the adapter's
-        `has_audio` guard -- here it is the spec-declared default)."""
+        registry test's audio-capability signal stays a clean non-None
+        check."""
         self.assertIsNone(LiteRTLMExportSpec().audio_input_style)
         self.assertIsNone(GemmaSpec().audio_input_style)
         self.assertIsNone(Gemma3Spec().audio_input_style)

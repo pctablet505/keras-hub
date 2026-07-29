@@ -658,11 +658,10 @@ class TestLiteRTLmExport(TestCase):
         self.assertIn("vision_mask", prefill_inputs)
 
     def test_multimodal_numeric_parity_gemma3(self):
-        """WS3.2: host-side multimodal (baked-in vision) numeric parity.
+        """Host-side multimodal (baked-in vision) numeric parity.
 
-        Locks a regression baseline against the CURRENT code before the
-        multimodal architecture refactor. Gemma3 is chosen because its
-        baked-in vision parity is already proven elsewhere; the tolerance is
+        Gemma3 is chosen because its baked-in vision parity is already
+        proven elsewhere; the tolerance is
         1e-4 (Gemma3's proven value), not relaxed.
         """
         # Random (not default) weights so the parity check is meaningful --
@@ -901,13 +900,10 @@ class TestLiteRTLmExport(TestCase):
     def test_export_separate_vision_encoder_has_end_of_vision_section(self):
         """A separate-vision Gemma3 export gains an END_OF_VISION section.
 
-        Before WS1.4, a separate-vision-encoder bundle's TFLite sections
-        were exactly ``{PREFILL_DECODE, VISION_ENCODER, VISION_ADAPTER}``
-        (see ``test_export_separate_vision_encoder_gemma3`` above, which
-        never asserts an END_OF_VISION section because none existed) --
-        this test builds the identical bundle and asserts the new
-        ``tf_lite_end_of_vision`` section is now present alongside the
-        three that were already there, mirroring litert-torch's
+        This test builds the same bundle as
+        ``test_export_separate_vision_encoder_gemma3`` above and asserts the
+        ``tf_lite_end_of_vision`` section is present alongside the three
+        standard ones, mirroring litert-torch's
         `export_hf` module packing an optional ``eoi.tflite`` model (see
         `KerasHubEndOfImageAdapter` in ``adapter.py``).
         """
@@ -929,9 +925,8 @@ class TestLiteRTLmExport(TestCase):
 
         section_model_types = self._litertlm_section_model_types(path)
         self.assertIn("tf_lite_end_of_vision", section_model_types)
-        # The ordinary sections from the pre-WS1.4 bundle are still present
-        # unchanged -- adding END_OF_VISION does not remove or replace any
-        # of them.
+        # The ordinary sections are still present unchanged -- adding
+        # END_OF_VISION does not remove or replace any of them.
         self.assertIn("tf_lite_prefill_decode", section_model_types)
         self.assertIn("tf_lite_vision_encoder", section_model_types)
         self.assertIn("tf_lite_vision_adapter", section_model_types)
@@ -1098,9 +1093,8 @@ class TestLiteRTLmAdapterHelpers(TestCase):
     def test_prepare_image_embeddings_raw_images_rejects_pixel_values(self):
         """A raw_images spec fed pixel_values raises the typed mismatch error.
 
-        WS1.2: the adapter dispatches on spec.vision_input_style, and a
-        style/args disagreement is a hard error (previously a silent
-        `return None, None`).
+        The adapter dispatches on spec.vision_input_style; a style/args
+        disagreement is a hard error.
         """
         from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
         from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
@@ -1157,7 +1151,7 @@ class TestLiteRTLmAdapterHelpers(TestCase):
         """KerasHubVisionEncoderAdapter.forward is keyed on the spec style,
         not on which argument is supplied: feeding the wrong tensor for the
         declared style raises the typed mismatch error before the encoder is
-        ever called (WS1.2 item a).
+        ever called.
 
         Uses a stub backbone whose vision_encoder is a sentinel that would
         raise if invoked -- proving the dispatch rejects the call up front,
