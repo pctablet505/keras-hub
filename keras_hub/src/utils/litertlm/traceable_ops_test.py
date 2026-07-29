@@ -1,18 +1,3 @@
-"""Parity tests for the litertlm "traceable op" patches in ``traceable_ops.py``.
-
-``traceable_ops.py`` temporarily replaces a handful of Keras torch-backend
-ops (``one_hot``, ``repeat``, ``slice``, ``take``, ``scatter_update``,
-``dot_product_attention``, ``amax``) with reimplementations that
-are
-friendlier to ``torch.export`` tracing (see each function's docstring for
-the specific tracing issue it works around). These tests do not exercise
-``torch.export`` at all -- they call the patched functions directly, on
-ordinary eager tensors, and check that they compute the exact same values
-as the original (unpatched) Keras implementation on representative
-shapes/dtypes/axes so a future change to one of these patches cannot
-silently change numerics without a failing test.
-"""
-
 import unittest
 
 import keras
@@ -29,14 +14,14 @@ def _to_np(x):
     return np.asarray(x)
 
 
+# Parity-only: patched ops are called directly on eager tensors (no
+# torch.export) and checked against the original Keras implementations.
 @unittest.skipUnless(
     keras.config.backend() == "torch",
     "The litertlm traceable-op patches only exist for the PyTorch backend.",
 )
 class TraceableOpsParityTest(TestCase):
-    # ------------------------------------------------------------------
-    # one_hot
-    # ------------------------------------------------------------------
+    # -- one_hot --
     def test_one_hot_matches_original(self):
         from keras.src.backend.torch import nn as torch_backend_nn
 
@@ -68,9 +53,7 @@ class TraceableOpsParityTest(TestCase):
         with self.assertRaises(ValueError):
             traceable_ops._patched_one_hot(torch.tensor([0]), 4, sparse=True)
 
-    # ------------------------------------------------------------------
-    # repeat
-    # ------------------------------------------------------------------
+    # -- repeat --
     def test_repeat_matches_original(self):
         from keras.src.backend.torch import numpy as torch_backend_numpy
 
@@ -127,9 +110,7 @@ class TraceableOpsParityTest(TestCase):
             with self.assertRaises(ValueError):
                 torch_backend_numpy.repeat(x, [1, 2], axis=0)
 
-    # ------------------------------------------------------------------
-    # slice (via `_make_patched_slice`)
-    # ------------------------------------------------------------------
+    # -- slice (via `_make_patched_slice`) --
     def test_slice_static_matches_original(self):
         from keras.src.backend.torch import core as torch_core
 
@@ -172,9 +153,7 @@ class TraceableOpsParityTest(TestCase):
         with self.assertRaises(NotImplementedError):
             patched_slice(x, [torch.tensor(0), torch.tensor(1), 0], [1, 1, 5])
 
-    # ------------------------------------------------------------------
-    # take
-    # ------------------------------------------------------------------
+    # -- take --
     def test_take_embedding_lookup_matches_original(self):
         from keras.src.backend.torch import numpy as torch_backend_numpy
 
@@ -232,9 +211,7 @@ class TraceableOpsParityTest(TestCase):
         patched = traceable_ops._patched_take(x, indices, axis=None)
         self.assertAllClose(expected, _to_np(patched))
 
-    # ------------------------------------------------------------------
-    # scatter_update
-    # ------------------------------------------------------------------
+    # -- scatter_update --
     def test_scatter_update_matches_original(self):
         from keras.src.backend.torch import core as torch_core
 
@@ -278,9 +255,7 @@ class TraceableOpsParityTest(TestCase):
                 inputs, indices, updates, reduction="bogus"
             )
 
-    # ------------------------------------------------------------------
-    # dot_product_attention
-    # ------------------------------------------------------------------
+    # -- dot_product_attention --
     def _reference_attention_inputs(self, num_query_heads, num_kv_heads):
         rng = np.random.default_rng(0)
         batch, q_len, kv_len, head_dim = 2, 3, 4, 8
@@ -396,9 +371,7 @@ class TraceableOpsParityTest(TestCase):
             _to_np(expected), _to_np(patched), atol=1e-5, rtol=1e-5
         )
 
-    # ------------------------------------------------------------------
-    # amax
-    # ------------------------------------------------------------------
+    # -- amax --
     def test_amax_matches_original(self):
         from keras.src.backend.torch import numpy as torch_backend_numpy
 

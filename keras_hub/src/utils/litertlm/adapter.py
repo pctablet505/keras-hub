@@ -35,13 +35,9 @@ def _cpu_default_device_scope():
 def _run_vision_encoder(vision_encoder, images, flatten_image_batch):
     """Run the vision encoder, reshaping inputs if necessary.
 
-    For encoders that expect a single image per sample (``flatten_image_batch
-    =True``, e.g. PaliGemma), the LiteRT-LM runtime contract still passes
-    ``[B, N, H, W, 3]``. We collapse the batch and image dimensions, run the
-    encoder, and return features with shape
-    ``[B * N, tokens_per_image, dim]``. Whether to flatten is a per-family
-    spec fact (``LiteRTLMExportSpec.flatten_image_batch``), passed in by the
-    caller, not re-derived from the encoder's Functional input spec here.
+    For single-image encoders (``flatten_image_batch=True``, e.g.
+    PaliGemma), collapse the runtime's ``[B, N, H, W, 3]`` stack to
+    ``[B * N, H, W, 3]`` and return ``[B * N, tokens_per_image, dim]``.
     """
     if not flatten_image_batch:
         out = vision_encoder(images)
@@ -125,14 +121,10 @@ def _run_vision_encoder_for_style(
             )
         )
     if reintroduce_n_axis and images.dim() == 4:
-        # The LiteRT-LM runtime drives the separate vision encoder with a
-        # single image per call and requires the encoder input tensor to
-        # be 3- or 4-D (it rejects 5-D at conversation creation). KerasHub
-        # vision encoders take [B, N, H, W, 3], so accept the runtime's
-        # [B, H, W, 3] and reintroduce the N=1 axis here. `reshape` is
-        # used instead of `unsqueeze`: litert-torch's converter folds an
-        # unsqueeze->reshape chain back to a 5-D conv input, which TFLite
-        # rejects at AllocateTensors time.
+        # The runtime feeds the separate vision encoder one 4-D image per
+        # call; KerasHub encoders take [B, N, H, W, 3], so reintroduce the
+        # N=1 axis. `reshape`, not `unsqueeze`: the converter folds an
+        # unsqueeze->reshape chain back to a 5-D conv input TFLite rejects.
         images = images.reshape(images.shape[0], 1, *images.shape[1:])
     return _run_vision_encoder(vision_encoder, images, flatten_image_batch)
 
@@ -167,13 +159,8 @@ class KerasHubLiteRTAdapter(nn.Module):
         kv_cache_k_0, kv_cache_v_0, ...: updated per-layer KV caches
 
     The adapter delegates to ``export_spec.stack_kv_cache``/
-    ``unstack_kv_cache`` (see ``LiteRTLMExportSpec`` in ``model_specs.py``)
-    to convert between the flat per-layer k/v tensors and whatever cache
-    shape ``model.call_with_cache()`` expects for this family -- by default
-    a single stacked ``[batch, num_layers, 2, cache_length, num_kv_heads,
-    head_dim]`` tensor -- rather than hardcoding that shape here, so a
-    future hybrid-cache family can override cache handling on its own spec
-    instead of this adapter growing per-family branches.
+    ``unstack_kv_cache`` to convert between the flat per-layer k/v tensors
+    and the cache shape ``model.call_with_cache()`` expects for this family.
     """
 
     def __init__(
@@ -194,20 +181,13 @@ class KerasHubLiteRTAdapter(nn.Module):
 
         vision_encoder = _get_vision_encoder(keras_model.backbone)
         self.has_vision = vision_encoder is not None
-        # How this family's vision encoder consumes its input -- see
-        # `LiteRTLMExportSpec.vision_input_style` in model_specs.py for the
-        # three possible values ("raw_images" / "patch_values" /
-        # "embedded_pixel_values"). `None` when the model has no vision
-        # encoder at all.
+        # The family's declared `vision_input_style`, or `None` when the
+        # model has no vision encoder.
         self.vision_input_style = (
             export_spec.vision_input_style if self.has_vision else None
         )
-        # Whether this family's vision encoder is single-image (4-D input) and
-        # the adapter must flatten the runtime's [B, N, H, W, 3] stack before
-        # calling it -- a per-family spec fact (see
-        # `LiteRTLMExportSpec.flatten_image_batch`), consulted instead of
-        # sniffing the encoder's Functional input rank. `False` when the model
-        # has no vision encoder.
+        # The family's declared `flatten_image_batch` (single-image ViT),
+        # or `False` when the model has no vision encoder.
         self.flatten_image_batch = (
             export_spec.flatten_image_batch if self.has_vision else False
         )
@@ -222,14 +202,8 @@ class KerasHubLiteRTAdapter(nn.Module):
         # a text-only Gemma4/Gemma3n spec declares `audio_input_style` even
         # with `audio_encoder=None`, so the spec is not a presence signal.
         self.has_audio = has_audio
-        # How this family's audio encoder consumes its input -- see
-        # `LiteRTLMExportSpec.audio_input_style` in model_specs.py
-        # ("embedded_mel" = encoder runs inside the backbone, "standalone_mel"
-        # = adapter calls backbone.audio_encoder directly). `None` when the
-        # model has no audio encoder. This replaces the old
-        # `"input_features" in call_with_cache params` signature sniff with the
-        # spec fact the family registry already resolved -- the same migration
-        # `vision_input_style` made (see export.py's separate-vision rejection).
+        # The family's declared `audio_input_style`, or `None` when the
+        # model has no audio encoder.
         self.audio_input_style = (
             export_spec.audio_input_style if self.has_audio else None
         )
@@ -299,8 +273,6 @@ class KerasHubLiteRTAdapter(nn.Module):
             input_features=input_features_out,
             input_features_mask=input_features_mask_out,
         )
-        # Prefill returns only KV caches; LiteRT-LM extracts last-token logits
-        # via a dedicated decode step.
         return self._call_with_cache(
             tokens, cache, cache_update_index, call_kwargs, return_logits=False
         )
@@ -372,15 +344,9 @@ class KerasHubLiteRTAdapter(nn.Module):
         """Return audio embeddings and optional input feature tensors.
 
         Audio is always baked into the PREFILL_DECODE trace; there is no
-        separate-audio-encoder export path (no audio analogue of
-        ``separate_vision_encoder``). The bundle format's ``AUDIO_*`` slots
-        exist, and ``self.keras_model.backbone.audio_encoder`` is already
-        called standalone below, so tracing it is not the blocker. What's
-        missing is a published upstream reference pipeline/contract:
-        ``litert_torch``'s reference exporter defines exactly what
-        ``VISION_ENCODER``/``VISION_ADAPTER`` must produce for the LiteRT-LM
-        runtime to consume correctly; there is no audio equivalent to
-        conform to (only a one-off, model-specific Moonshine ASR example).
+        separate-audio-encoder export path because upstream publishes no
+        reference contract for audio bundle sections (unlike
+        ``VISION_ENCODER``/``VISION_ADAPTER``).
         """
         if not self.has_audio or audio_mel is None:
             return None, None, None
@@ -436,14 +402,9 @@ class KerasHubLiteRTAdapter(nn.Module):
             cache_update_index,
             **call_kwargs,
         )
-        # Keras ops (``slice_update``/``scatter_update``, used internally by
-        # every model's cache-update mechanism) are purely functional: they
-        # never mutate their input in place, always returning a freshly
-        # allocated tensor. `updated_cache` is therefore already guaranteed
-        # to be independent of the `cache` argument above, without an extra
-        # `.clone()` (verified empirically: `updated_cache.data_ptr() !=
-        # cache.data_ptr()`, and mutating `updated_cache` in place does not
-        # affect `cache`).
+        # Keras cache-update ops (`slice_update`/`scatter_update`) are
+        # purely functional, so `updated_cache` is already a fresh,
+        # non-aliased tensor -- no `.clone()` needed.
         outputs = self.export_spec.unstack_kv_cache(
             updated_cache, self.num_layers
         )
@@ -484,14 +445,11 @@ class KerasHubLiteRTAdapter(nn.Module):
 class KerasHubVisionEncoderAdapter(nn.Module):
     """Adapter that wraps a KerasHub vision encoder for separate export.
 
-    Gemma3 accepts raw ``images`` [B, N, H, W, 3]. Gemma4 accepts preprocessed
-    patches via ``pixel_values`` and ``pixel_position_ids``. Which of the two
-    the encoder is called with is dispatched on the family's declared
-    ``spec.vision_input_style`` (passed in at construction), not inferred from
-    which argument the caller happened to supply -- the same
-    spec-over-introspection contract the baked-in adapter uses. The output is
-    always returned as a dictionary named ``features`` so that the LiteRT-LM
-    signature matches upstream tensor names.
+    Gemma3 accepts raw ``images`` [B, N, H, W, 3]; Gemma4 accepts
+    preprocessed patches. The call is dispatched on the family's declared
+    ``spec.vision_input_style`` (passed in at construction), not inferred
+    from which argument the caller supplied. The output is always returned
+    as a dict named ``features`` to match upstream tensor names.
     """
 
     def __init__(self, keras_model, vision_input_style, flatten_image_batch):
@@ -525,12 +483,9 @@ class KerasHubVisionAdapter(nn.Module):
     """No-op vision adapter exported as a separate LiteRT-LM model.
 
     KerasHub already projects vision features inside the vision encoder, so
-    this adapter simply renames ``features`` to ``mm_embedding``. It is
-    exported as a separate model — rather than folding the rename into the
-    encoder — because the LiteRT-LM bundle format defines ``VISION_ENCODER``
-    and ``VISION_ADAPTER`` as two distinct slots (``TfLiteModelType`` in
-    ``litert_lm_builder``); this conforms to that two-slot contract, it does
-    not introduce the split.
+    this adapter simply renames ``features`` to ``mm_embedding``. It is a
+    separate model because the LiteRT-LM bundle format defines
+    ``VISION_ENCODER`` and ``VISION_ADAPTER`` as two distinct slots.
     """
 
     def forward(self, features):
@@ -540,36 +495,22 @@ class KerasHubVisionAdapter(nn.Module):
 class KerasHubEndOfImageAdapter(nn.Module):
     """End-of-image (EOI) embedding, exported as a separate LiteRT-LM model.
 
-    Mirrors litert-torch's ``END_OF_VISION`` bundle section: upstream's
-    ``export_hf`` packs a small ``eoi.tflite`` model whose only output is
-    ``get_input_embeddings()(eoi_token_ids)`` (see
-    ``export_hf/model_ext/gemma4_unified/vision_exportable.py``'s
-    ``LiteRTExportableModuleForGemma4UnifiedEndOfImage``), and
-    ``export_hf/core/litert_lm_builder.py`` adds it as ``END_OF_VISION``
-    whenever that model is present. KerasHub's own vision adapter
-    (``KerasHubVisionAdapter`` above) is a plain rename and does not fold an
-    EOI embedding into ``mm_embedding`` the way upstream's gemma3/gemma3n
-    adapters do (they concat ``eoi_emb`` onto ``image_features``), so this
-    module supplies the same embedding as its own bundle section instead,
-    for separate-vision exports of families that declare an
-    ``end_of_vision_token`` (see ``LiteRTLMExportSpec`` in
-    ``model_specs.py``).
+    Mirrors litert-torch's ``END_OF_VISION`` bundle section: upstream packs
+    an ``eoi.tflite`` whose only output is the end-of-image token embedding.
+    KerasHub's vision adapter is a plain rename and does not fold an EOI
+    embedding into ``mm_embedding`` the way upstream's gemma3/gemma3n
+    adapters do, so the embedding ships as its own section for
+    separate-vision exports of families declaring an ``end_of_vision_token``.
 
     Takes no runtime inputs -- the end-of-image token id(s) are fixed at
-    export time (resolved once from the family's tokenizer before this
-    module is constructed), so the embedding lookup constant-folds during
-    tracing, exactly like the upstream module it mirrors.
+    export time, so the embedding lookup constant-folds during tracing.
     """
 
     def __init__(self, keras_model, eoi_token_ids):
         super().__init__()
         self.token_embedding = keras_model.backbone.token_embedding
-        # A plain Python list baked in at construction time, matching
-        # upstream's inline `torch.tensor(...)` inside `forward` (see
-        # `LiteRTExportableModuleForGemma4UnifiedEndOfImage.forward`) rather
-        # than a registered buffer: the id(s) are export-time constants, not
-        # model state, and this is the proven-working upstream form for an
-        # input-less traced signature.
+        # A plain Python list (not a registered buffer): the ids are
+        # export-time constants, matching upstream's input-less form.
         self._eoi_token_ids = list(eoi_token_ids)
 
     def forward(self):

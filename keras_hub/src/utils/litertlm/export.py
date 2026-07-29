@@ -156,13 +156,8 @@ def _validate_quant_config(quant_config):
 
 
 # A cheap sanity check on `hf_tokenizer_path` compatibility, not exact
-# validation: small differences (e.g. a handful of reserved/special tokens)
-# are expected and not flagged. Only a difference of more than a few hundred
-# tokens *and* a meaningfully different order of magnitude (a >=5x ratio)
-# together indicate the bundled tokenizer almost certainly does not match
-# the model's embedding table -- e.g. bundling a ~32k-vocab Llama tokenizer
-# with a model whose embedding table was sized for a ~256k-vocab Gemma
-# tokenizer.
+# validation: only a large absolute difference AND a >=5x ratio together
+# flag a tokenizer from an entirely different model/family.
 _HF_TOKENIZER_VOCAB_MISMATCH_ABS_THRESHOLD = 300
 _HF_TOKENIZER_VOCAB_MISMATCH_RATIO_THRESHOLD = 5.0
 
@@ -467,12 +462,9 @@ def _build_prefill_inputs(plan):
                     )
                 )
             else:
-                # "raw_images" (Gemma3/PaliGemma) and "embedded_pixel_values"
-                # (Gemma3n) both need the same raw `[B, N, H, W, 3]` images
-                # sample tensor here -- they only diverge in how the adapter
-                # *runs* the vision encoder at trace time (see
-                # `KerasHubLiteRTAdapter._prepare_image_embeddings`), not in
-                # what shape the prefill signature needs.
+                # "raw_images"/"embedded_pixel_values" both take a raw
+                # `[B, N, H, W, 3]` sample tensor here; they only diverge
+                # in how the adapter runs the encoder at trace time.
                 base.update(
                     _build_vision_sample_inputs(
                         batch_size=1,
@@ -664,14 +656,8 @@ def _trace_and_convert(
                 **kwargs,
             ).convert(quant_config=quant_config, lightweight_conversion=True)
 
-            # Optionally export an END_OF_VISION model: a small, input-less
-            # signature whose only output is the family's end-of-image
-            # token embedding, mirroring litert-torch's `export_hf` module
-            # (see `KerasHubEndOfImageAdapter`'s docstring). Only families
-            # that declare `LiteRTLMExportSpec.end_of_vision_token` and
-            # whose tokenizer actually resolves it opt in; every other
-            # family's bundle is unaffected (`eoi_edge` stays `None`, so
-            # `_assemble_bundle` below adds no `END_OF_VISION` section).
+            # An END_OF_VISION model is exported only when the family
+            # declares an EOI token and the tokenizer resolves it.
             eoi_token_ids = plan.spec.get_end_of_vision_token_ids(tokenizer)
             if eoi_token_ids is not None:
                 eoi_adapter = KerasHubEndOfImageAdapter(
@@ -686,13 +672,9 @@ def _trace_and_convert(
                     quant_config=quant_config, lightweight_conversion=True
                 )
             elif plan.spec.end_of_vision_token is not None:
-                # The family declares an EOI token, but it did not resolve
-                # to a real id in this tokenizer's vocabulary (e.g. a test
-                # fixture with a truncated vocab). Skip the section rather
-                # than bundle an embedding for the wrong (unknown) token --
-                # an absent END_OF_VISION section is a no-op; a wrong one
-                # would silently ship an incorrect embedding under a
-                # section name the runtime is expected to trust.
+                # The declared EOI token did not resolve to a real id in
+                # this tokenizer's vocab: skip the section rather than
+                # bundle an embedding for the wrong (unknown) token.
                 warnings.warn(
                     "Could not resolve end-of-image token "
                     f"{plan.spec.end_of_vision_token!r} to a token id for "
@@ -807,10 +789,7 @@ def _assemble_bundle(
         )
         if eoi_tflite_path is not None:
             # Ordered after VISION_ADAPTER, matching upstream's section
-            # order (`export_hf/core/litert_lm_builder.py`:
-            # PREFILL_DECODE -> ... -> VISION_ENCODER -> VISION_ADAPTER ->
-            # END_OF_VISION). See `KerasHubEndOfImageAdapter`'s docstring
-            # for why this section exists and which families emit it.
+            # order (PREFILL_DECODE -> ... -> END_OF_VISION).
             builder.add_tflite_model(
                 eoi_tflite_path,
                 litert_lm_builder.TfLiteModelType.END_OF_VISION,
@@ -885,9 +864,8 @@ def export_to_litertlm(
     that declare an end-of-image token (``LiteRTLMExportSpec.
     end_of_vision_token``, e.g. Gemma3/Gemma4) additionally get a fourth,
     input-less ``END_OF_VISION`` model whose only output is that token's
-    embedding, mirroring upstream ``export_hf``'s optional ``eoi.tflite``
-    section -- an upstream-parity addition; families with no declared
-    end-of-image token (e.g. PaliGemma) emit no such section.
+    embedding; families with no declared end-of-image token (e.g.
+    PaliGemma) emit no such section.
 
     **Bucketing:** ``prefill_seq_len`` accepts either a single ``int`` or a
     ``list[int]``. When a list is provided (e.g.
@@ -895,12 +873,9 @@ def export_to_litertlm(
     signature per bucket. At runtime the LiteRT-LM executor dispatches to
     the smallest bucket that fits the actual prompt, avoiding wasted
     computation on padding. For vision-capable models (Gemma3, Gemma3n,
-    Gemma4, PaliGemma), bucketing is currently disabled family-wide: every
-    prefill bucket must equal ``cache_length``. This is a conservative
-    default (governed by the ``allows_vision_bucketing`` export spec flag),
-    not a confirmed per-family limitation -- it was first observed for
-    Gemma3's image attention-mask computation and has not been re-assessed
-    for the other vision families.
+    Gemma4, PaliGemma), bucketing is currently disabled family-wide (every
+    prefill bucket must equal ``cache_length``) as a conservative default,
+    governed by the ``allows_vision_bucketing`` export spec flag.
 
     **Quantization:** ``quant_config`` is forwarded to
     ``litert_torch.convert()`` for in-graph quantization. It must be an
@@ -986,13 +961,9 @@ def export_to_litertlm(
             installed.
     """
     path = os.fspath(path)
-    # Resolve the model-family export spec once and thread it through the
-    # rest of the pipeline (and into the adapter), instead of re-deriving
-    # family checks at each site. `llm_model_type`, when given, is an explicit
-    # caller override for presets indistinguishable from another family by
-    # class (e.g. `function_gemma`, a plain `Gemma3CausalLM`). Resolving up
-    # front also lets non-exportable models fail fast via
-    # `LiteRTLMExportSpec.check_exportable`, before any other validation.
+    # Resolve the model-family spec once, up front, and thread it through
+    # the pipeline; `llm_model_type` is an explicit override for presets
+    # indistinguishable by class. Non-exportable models fail fast here.
     spec = resolve_export_spec(model, llm_model_type=llm_model_type)
     spec.check_exportable(model)
     if sampler_config is not None and not isinstance(
@@ -1005,11 +976,8 @@ def export_to_litertlm(
             f"{type(sampler_config).__name__}."
         )
     tokenizer = _get_tokenizer(model)
-    # `_validate_export_args` returns the normalized (lowercased)
-    # `backend_constraint` alongside `prefill_seq_lens`; rebind the local
-    # here so the normalized value -- not the original, possibly
-    # mixed-case, argument -- is what flows into `_assemble_bundle` /
-    # `builder.add_tflite_model` below.
+    # Use the normalized (lowercased) `backend_constraint` returned by
+    # `_validate_export_args`, not the original argument.
     prefill_seq_lens, backend_constraint = _validate_export_args(
         model,
         path,
@@ -1086,14 +1054,6 @@ def export_to_litertlm(
             "encoder."
         )
 
-    # Some vision families run their encoder *inside* the backbone
-    # (`vision_input_style == "embedded_pixel_values"`, e.g. Gemma3n), so
-    # there is no separable vision encoder to pack as its own bundle
-    # section. Whether a family supports the separate-vision export path is
-    # declared once, per family, on the spec (`supports_separate_vision`) --
-    # ask it directly instead of re-deriving the fact from the input style
-    # here, so the {baked, separate} support matrix is readable from the
-    # spec table rather than reconstructed from this branch.
     if (
         separate_vision_encoder
         and has_vision
@@ -1108,16 +1068,6 @@ def export_to_litertlm(
             "(the default)."
         )
 
-    # Vision-capable models currently require every prefill bucket to equal
-    # cache_length. This is enforced family-wide (Gemma3, Gemma3n, Gemma4,
-    # PaliGemma) as a conservative default via the `allows_vision_bucketing`
-    # spec flag, not a Gemma3-specific rule: the constraint was first observed
-    # for Gemma3's image attention-mask computation, but no per-family
-    # assessment has confirmed whether the other three vision families
-    # actually need cache_length == input_length. Relaxing it for a family
-    # that provably does not is a future, numerics-gated change -- flip that
-    # family's `allows_vision_bucketing` to True (see the spec field), no edit
-    # here required.
     if (
         has_vision
         and not spec.allows_vision_bucketing
@@ -1134,10 +1084,8 @@ def export_to_litertlm(
             f"Pass a single `prefill_seq_len` equal to `cache_length`."
         )
 
-    # Hoist vision shape values that are used both when building prefill inputs
-    # and when exporting a separate vision encoder/adapter. Keeping them outside
-    # the loop prevents accidental scope leakage and makes the loop body easier
-    # to read.
+    # Hoist vision shape values used both in prefill-input building and in
+    # separate vision encoder/adapter export.
     max_images = None
     tokens_per_image = None
     if has_vision:
@@ -1210,11 +1158,9 @@ def export_to_litertlm(
         ):
             import litert_torch
 
-            # The import above enables ``jax_enable_x64`` only on its first
-            # import; when the module is already cached, the ambient value
-            # (possibly False, restored by an earlier export) applies. The
-            # JAX bridge requires x64 for consistent int64 dtypes, so pin it
-            # explicitly for the conversion.
+            # The import above enables ``jax_enable_x64`` only on first
+            # import; the JAX bridge requires x64 for consistent int64
+            # dtypes, so pin it explicitly for the conversion.
             try:
                 import jax
 
@@ -1456,8 +1402,7 @@ def _build_llm_metadata(
 ):
     """Serialize an ``LlmMetadata`` protobuf to *path*."""
     # The protobuf lives under an internal-looking subpackage of
-    # ``litert-lm-builder``. This is the only way the upstream package exposes
-    # the metadata schema, so we import defensively and surface a clear error
+    # ``litert-lm-builder``; import defensively and surface a clear error
     # if the internal layout changes.
     try:
         from litert_lm_builder.runtime.proto import llm_metadata_pb2
@@ -1480,17 +1425,9 @@ def _build_llm_metadata(
     if end_id is not None:
         stop_token_ids.append(int(end_id))
 
-    # Some families additionally mark the end of a *chat turn* with a
-    # second, distinct token (e.g. Gemma's ``<end_of_turn>``, Llama3's
-    # ``<|eot_id|>``) -- see ``LiteRTLMExportSpec.get_chat_stop_token_ids``.
-    # This used to be a single hardcoded ``<end_of_turn>`` lookup here,
-    # unconditionally applied to every tokenizer regardless of family (it
-    # simply no-opped for non-Gemma tokenizers that don't have the token in
-    # vocab) -- silently giving no chat-stop-token to e.g. Llama3 or Qwen
-    # families that need a *different* second token. Deduplicate against
-    # ``end_token_id`` since some families' override intentionally returns
-    # the same id (e.g. Qwen3's ``<|im_end|>``, documenting that it is
-    # already the primary EOS rather than a coincidence).
+    # Add each family's extra chat-turn stop token (e.g. Gemma's
+    # `<end_of_turn>`; see `LiteRTLMExportSpec.get_chat_stop_token_ids`),
+    # de-duplicated against `end_token_id`.
     for extra_id in spec.get_chat_stop_token_ids(tokenizer):
         extra_id = int(extra_id)
         if extra_id not in stop_token_ids:
@@ -1511,25 +1448,15 @@ def _build_llm_metadata(
     if audio_cfg is not None:
         spec.populate_audio_metadata(meta, audio_cfg)
 
-    # Populate function-calling fields for specs that declare them (currently
-    # only `FunctionGemmaSpec`, reached via tokenizer auto-detection).
-    # A base-class no-op for every other family, so this adds nothing to
-    # existing model types -- the same convention as the vision/audio hooks
-    # above. Skipped when `llm_model_type` is an explicit caller override:
-    # litert-torch skips its model-specific metadata builder whenever
-    # `litert_lm_model_type_override` is set
-    # (`export_hf/core/litert_lm_builder.py` ~296), so an override yields the
-    # bare `llm_model_type` oneof with no model-specific fields.
+    # Populate function-calling fields (only `FunctionGemmaSpec` overrides
+    # the base no-op). Skipped on an explicit `llm_model_type` override:
+    # litert-torch also skips its model-specific metadata builder then.
     if not model_type_overridden:
         spec.populate_function_gemma_metadata(meta)
 
-    # Sampler defaults are written only when the caller explicitly passes a
-    # `sampler_config`; otherwise the field is omitted so the runtime picks
-    # its own sampling policy. Mirrors litert-torch export_hf's conditional
-    # `sampler_params` population (core/litert_lm_builder.py ~189-232),
-    # except that GREEDY(top_k==1) is deliberately emitted as TOP_K k=1
-    # (see below). keras-hub ships no default sampler (see
-    # model_specs.SamplerConfig).
+    # Sampler defaults are written only when the caller passes a
+    # `sampler_config` (mirroring litert-torch's conditional
+    # `sampler_params`); otherwise the runtime picks its own policy.
     if sampler_config is not None:
         try:
             from litert_lm_builder.runtime.proto import sampler_params_pb2

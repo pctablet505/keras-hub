@@ -1,26 +1,10 @@
 """Model-family export specs for LiteRT-LM export.
 
-Before this module existed, model-family-specific knowledge for LiteRT-LM
-export was scattered across roughly seven independent sites in
-``export.py`` and ``adapter.py``: an isinstance-based ``LlmModelType``
-mapping, a backbone class-name ``str.startswith("Gemma3n")`` check for KV
-cache layout, getattr-chain fallbacks for cache/vision/audio config, ad-hoc
-vision/audio special-token metadata branches, input-tensor-name sniffing to
-detect Gemma4-style vision encoders, a Gemma4-specific ``mm_embedding``
-reshape, and a Gemma3n-specific attention-mask override. Each of those sites
-had to independently know which model family it was looking at.
-
-``LiteRTLMExportSpec`` centralizes that knowledge. A single spec instance is
-resolved once per export call (see ``resolve_export_spec``) from a lazy,
-``isinstance``-based registry (mirroring the lazy-import pattern already
-used elsewhere in this package), and is threaded through the rest of the
-export pipeline and the adapter instead of re-deriving family checks at
-each site.
-
-``LiteRTLMExportSpec`` itself is also the fallback used for any model not
-explicitly registered below (matching today's "unrecognized models map to
-generic_model" behavior). This is a pure refactor of detection/config
-lookup -- it does not change behavior for any currently-supported model.
+``LiteRTLMExportSpec`` centralizes per-family export knowledge. A single
+spec instance is resolved once per export call (see ``resolve_export_spec``)
+from a lazy, ``isinstance``-based registry and threaded through the export
+pipeline and the adapter. The base class itself is the fallback for any
+model family not explicitly registered (``model_type="generic_model"``).
 """
 
 import dataclasses
@@ -44,17 +28,7 @@ def _get_vision_encoder(backbone):
     )
 
 
-# Special token strings used when populating vision/audio metadata. Keeping
-# them as named constants makes it easy to audit which tokens each model
-# family expects and avoids scattering literals through the spec classes.
-# Defined ahead of the spec classes below (rather than at the bottom of the
-# file, where they used to live) because ``Gemma3Spec``/``Gemma4Spec`` now
-# also reference ``_GEMMA3_END_OF_IMAGE_TOKEN``/``_GEMMA4_END_OF_IMAGE_TOKEN``
-# as plain class attributes (``end_of_vision_token =`` below), which
-# evaluate immediately at class-body execution time -- unlike the
-# ``populate_vision_metadata`` method bodies further down, which only
-# resolve these names later, at export time, once the whole module has
-# finished loading.
+# Special token strings used when populating vision/audio metadata.
 _GEMMA3_START_OF_IMAGE_TOKEN = "<start_of_image>"
 _GEMMA3_END_OF_IMAGE_TOKEN = "<end_of_image>"
 _GEMMA4_START_OF_IMAGE_TOKEN = "<|image>"
@@ -62,17 +36,9 @@ _GEMMA4_END_OF_IMAGE_TOKEN = "<image|>"
 _AUDIO_START_TOKEN = "<|audio>"
 _AUDIO_END_TOKEN = "<audio|>"
 
-# Function-calling ("function_gemma") metadata strings. keras-hub's Gemma3
-# SentencePiece tokenizer does not expose the named function-calling tokens
-# litert-torch's Gemma4 metadata builder reads from a HuggingFace
-# ``special_tokens_map`` (``stc_token``/``etc_token``/``escape_token``/
-# ``str_token``), so the strings are declared here as named constants instead
-# of sniffed from the tokenizer -- the same spec-supplies-the-literal pattern
-# the vision/audio token constants above already use. These are the standard
-# Gemma ``tool_code`` fence convention, and mirror the fields litert-torch's
-# ``export_hf/model_ext/gemma4/metadata_builder.py`` (~39-54) populates for
-# its own function-calling support (``FunctionGemma`` shares Gemma4's exact
-# function-calling proto field block, field numbers 5-14).
+# Function-calling ("function_gemma") metadata strings, supplied as
+# literals because keras-hub's Gemma3 tokenizer has no HuggingFace
+# ``special_tokens_map`` carrying them (proto fields shared with Gemma4).
 _FUNCTION_GEMMA_CODE_FENCE_START = "```tool_code"
 _FUNCTION_GEMMA_CODE_FENCE_END = "```"
 _FUNCTION_GEMMA_FUNCTION_RESPONSE_START = "```tool_output"
@@ -83,20 +49,11 @@ _FUNCTION_GEMMA_ESCAPE_TOKEN = "<escape>"
 class SamplerConfig:
     """Sampler defaults embedded in a LiteRT-LM bundle's ``LlmMetadata``.
 
-    This mirrors the conditional ``sampler_params`` semantics of
-    litert-torch's ``export_hf`` (``core/litert_lm_builder.py`` ~189-232):
-    the proto field is only written when a caller explicitly requests it.
-    The sampler *type* is derived from the supplied ``top_k``/``top_p``.
-
-    NOTE: the runtime (litertlm-android 0.13.1, host ``litert_lm`` 0.13.1)
-    does **not** implement the proto ``GREEDY`` sampler type. We therefore
-    emit ``TOP_K`` with ``k=1`` for greedy generation instead.
-
-    NOTE (scope): this exists to give on-device verification a way to force
-    deterministic greedy generation (``GREEDY_SAMPLER_CONFIG``); it is not a
-    general user-facing sampler API. keras-hub deliberately ships **no
-    default** sampler -- omitting ``sampler_config`` omits the proto field
-    entirely, letting the runtime pick its own sampling policy.
+    Mirrors the conditional ``sampler_params`` semantics of litert-torch's
+    ``export_hf``: the proto field is only written when a caller explicitly
+    requests it. keras-hub ships no default sampler -- omitting
+    ``sampler_config`` leaves the field unset, letting the runtime pick its
+    own sampling policy.
 
     Args:
         top_k: Optional int >= 1. ``top_k == 1`` selects deterministic
@@ -138,9 +95,8 @@ class SamplerConfig:
             )
 
 
-#: Deterministic greedy sampling (``top_k == 1``). Used by the on-device
-#: host-vs-device verification path (WS4.5) to force reproducible generation.
-#: This is the ONLY named preset keras-hub ships -- see ``SamplerConfig``.
+#: Deterministic greedy sampling (``top_k == 1``), used by the on-device
+#: host-vs-device verification path. The only named preset keras-hub ships.
 GREEDY_SAMPLER_CONFIG = SamplerConfig(top_k=1)
 
 
@@ -158,18 +114,12 @@ def _single_stacked_support_description():
 class LiteRTLMExportSpec:
     """Default LiteRT-LM export behavior for a model family.
 
-    Also used, unmodified, as the spec for any model family that is not
-    explicitly registered in ``_EXPORT_SPEC_REGISTRY`` below -- this mirrors
-    today's fallback to ``"generic_model"`` / the generic getattr-chain
-    config lookups for unrecognized backbones.
-
-    Subclasses override the class attributes below and/or the methods
-    further down to customize behavior for one model family. These are
-    plain class attributes (not ``dataclasses.dataclass`` fields):
-    subclasses only ever override the *class-level default*, never set a
-    per-instance value at construction time, so a plain attribute avoids
-    the pitfall of a dataclass-generated ``__init__`` re-baking in the
-    parent's field default over a subclass's override.
+    Also used, unmodified, as the spec for any model family not explicitly
+    registered in ``_EXPORT_SPEC_REGISTRY`` (the ``"generic_model"``
+    fallback). Subclasses customize behavior via the plain class attributes
+    and methods below; plain attributes (not dataclass fields) avoid a
+    dataclass-generated ``__init__`` re-baking the parent's field default
+    over a subclass's override.
     """
 
     #: The ``LlmMetadata.llm_model_type`` oneof name for this family.
@@ -178,118 +128,34 @@ class LiteRTLMExportSpec:
     #: ``[batch, cache_length, num_kv_heads, head_dim]``; ``"gemma3n"`` is
     #: ``[batch, num_kv_heads, cache_length, head_dim]``.
     cache_layout = "standard"
-    #: Shape of the ``cache`` argument ``call_with_cache`` expects.
-    #: ``"single_stacked"`` (every currently-supported family) is a single
-    #: stacked ``[batch, num_layers, 2, cache_length, num_kv_heads,
-    #: head_dim]`` KV-cache tensor -- exactly what the default
-    #: ``stack_kv_cache`` below builds. ``"hybrid"`` (Qwen3.5) means
-    #: ``call_with_cache`` instead expects a ``(kv_cache, conv_cache,
-    #: recurrent_cache)`` tuple, because hybrid full-attention/
-    #: linear-attention architectures need two structurally different
-    #: per-layer caches. The default ``stack_kv_cache``/``unstack_kv_cache``
-    #: do not build/parse that shape (no current spec overrides them to), so
-    #: ``export_to_litertlm`` fails fast on any spec with
-    #: ``cache_structure != "single_stacked"`` (see the early validation in
-    #: ``export.py``) instead of letting a mismatched cache reach
-    #: ``call_with_cache`` and fail with a cryptic ``IndexError``.
+    #: Shape of the ``cache`` argument ``call_with_cache`` expects:
+    #: ``"single_stacked"`` is one stacked KV tensor (what the default
+    #: ``stack_kv_cache`` builds); any other value fails fast in export.
     cache_structure = "single_stacked"
-    #: How this family's vision encoder consumes its input (only meaningful
-    #: when `get_vision_config` returns non-``None``). One of:
-    #: - ``"raw_images"`` (default): the vision encoder -- or
-    #:   ``KerasHubVisionEncoderAdapter`` on the separate-vision-encoder
-    #:   export path -- is called with a raw ``[B, N, H, W, 3]`` images
-    #:   tensor (Gemma3, PaliGemma).
-    #: - ``"patch_values"``: the vision encoder is called with preprocessed
-    #:   ``pixel_values`` + ``pixel_position_ids`` patch tensors (Gemma4).
-    #: - ``"embedded_pixel_values"``: the vision encoder runs *inside* the
-    #:   backbone, so `call_with_cache` itself consumes raw ``pixel_values``
-    #:   directly and the adapter never calls a separate vision encoder at
-    #:   all (Gemma3n). `separate_vision_encoder=True` is meaningless for
-    #:   this style and is rejected in `export_to_litertlm`.
+    #: How the vision encoder consumes its input: ``"raw_images"`` (a raw
+    #: ``[B, N, H, W, 3]`` tensor; Gemma3, PaliGemma), ``"patch_values"``
+    #: (preprocessed patches; Gemma4), or ``"embedded_pixel_values"``
+    #: (encoder runs inside the backbone; Gemma3n).
     vision_input_style = "raw_images"
-    #: How this family's audio encoder consumes its input (only meaningful
-    #: when `get_audio_config` returns non-``None``). One of:
-    #: - ``None`` (default): the family has no audio encoder.
-    #: - ``"embedded_mel"``: the audio encoder runs *inside* the backbone, so
-    #:   `call_with_cache` itself consumes the pre-extracted mel spectrogram
-    #:   (``input_features``/``input_features_mask``) directly and the adapter
-    #:   never calls a separate audio encoder (Gemma3n).
-    #: - ``"standalone_mel"``: the adapter calls
-    #:   ``backbone.audio_encoder(audio_mel, audio_mel_mask)`` as a standalone
-    #:   in-trace stage and passes the resulting embeddings into
-    #:   `call_with_cache` (Gemma4).
-    #: This replaces the old ``"input_features" in call_with_cache signature``
-    #: sniff in ``adapter.py`` -- the same migration ``vision_input_style``
-    #: already made (see the comment near the separate-vision-encoder rejection
-    #: in ``export.py``): the spec, resolved once from the family registry,
-    #: already knows this about its own family, so ask it instead of
-    #: re-deriving the fact from signature introspection at trace time.
+    #: How the audio encoder consumes its input: ``None`` (no audio),
+    #: ``"embedded_mel"`` (encoder inside the backbone; Gemma3n), or
+    #: ``"standalone_mel"`` (adapter calls ``backbone.audio_encoder``;
+    #: Gemma4).
     audio_input_style = None
-    #: Whether this family's vision encoder accepts only a single image per
-    #: call (a 4-D ``[B, H, W, 3]`` input), so the adapter must collapse the
-    #: LiteRT-LM runtime's ``[B, N, H, W, 3]`` images tensor to
-    #: ``[B * N, H, W, 3]`` before calling it and treat the result as
-    #: ``[B * N, tokens_per_image, dim]``. Default ``False``: the encoder
-    #: accepts the batched 5-D stack directly (Gemma3). ``True`` for PaliGemma,
-    #: whose ViT is 4-D-only. This replaces the old
-    #: ``_encoder_expects_single_image`` Functional-input-spec sniff in
-    #: ``adapter.py`` -- the same spec-over-introspection migration
-    #: ``vision_input_style``/``audio_input_style`` already made: the family
-    #: registry already knows this fact, so declare it instead of re-deriving
-    #: it from ``vision_encoder.inputs[0].shape`` at trace time.
+    #: Whether the vision encoder accepts only a single 4-D image per call,
+    #: so the adapter flattens the ``[B, N, H, W, 3]`` stack (PaliGemma).
     flatten_image_batch = False
-    #: The end-of-image (EOI) special-token string for this family, or
-    #: ``None`` (default) if the family has no distinct EOI token. Only
-    #: consulted on the separate-vision-encoder export path
-    #: (``export_to_litertlm(..., separate_vision_encoder=True)``), where it
-    #: controls whether an ``END_OF_VISION`` bundle section is emitted --
-    #: mirroring litert-torch's ``export_hf`` module, which packs an
-    #: ``eoi.tflite`` model producing ``get_input_embeddings()(eoi_token_ids)``
-    #: (see ``export_hf/model_ext/gemma4_unified/vision_exportable.py``'s
-    #: ``LiteRTExportableModuleForGemma4UnifiedEndOfImage`` and
-    #: ``export_hf/core/litert_lm_builder.py``'s conditional
-    #: ``END_OF_VISION`` section). Set this to the family's EOI token string
-    #: (e.g. Gemma3's ``"<end_of_image>"``, Gemma4's ``"<image|>"``) to opt
-    #: in; leave ``None`` for families with no EOI token (e.g. PaliGemma,
-    #: which has no end-of-image special token at all) or whose separate-
-    #: vision export never reaches this point (e.g. Gemma3n, which rejects
-    #: `separate_vision_encoder=True` before vision-model building).
+    #: The end-of-image (EOI) special-token string, or ``None`` if the
+    #: family has none. Consulted only on the separate-vision export path,
+    #: where it controls whether an ``END_OF_VISION`` section is emitted.
     end_of_vision_token = None
-    #: Whether this family's vision path supports multi-bucket prefill
-    #: (a ``prefill_seq_len`` list with values other than ``cache_length``).
-    #: Default ``False`` for every vision-capable family: the multimodal
-    #: export path currently requires every prefill bucket to equal
-    #: ``cache_length`` (enforced in ``export_to_litertlm``). That restriction
-    #: is applied family-wide as a conservative default -- it was originally
-    #: characterized as a Gemma3-specific attention-mask constraint, but it has
-    #: never been assessed per family (Gemma3n/Gemma4/PaliGemma inherit it
-    #: without a family-specific analysis of whether their vision attention
-    #: actually needs it). Relaxing it for a family that provably does not need
-    #: cache_length == input_length is a future, numerics-gated change: set
-    #: ``allows_vision_bucketing = True`` on that family's spec once verified.
-    #: (Only consulted when ``get_vision_config`` returns non-``None``;
-    #: text-only families are unaffected and keep full bucketing support.)
+    #: Whether this family's vision path supports multi-bucket prefill.
+    #: Default ``False``: the bucketing ban in ``export_to_litertlm`` is a
+    #: conservative family-wide default; relaxing it is numerics-gated.
     allows_vision_bucketing = False
-    #: Whether this family supports the separate-vision-encoder export path
-    #: (``export_to_litertlm(..., separate_vision_encoder=True)``), which
-    #: packs the vision encoder as its own ``VISION_ENCODER`` +
-    #: ``VISION_ADAPTER`` (+ ``END_OF_VISION``) bundle sections instead of
-    #: fusing it into ``PREFILL_DECODE``. Default ``True``: every vision
-    #: family whose encoder is callable as a standalone stage (Gemma3,
-    #: Gemma4, PaliGemma, and the generic fallback) supports both the
-    #: baked-in and the separate mode. ``False`` for families whose vision
-    #: encoder runs *inside* the backbone (Gemma3n, ``vision_input_style ==
-    #: "embedded_pixel_values"``): there is no separable encoder to export,
-    #: so ``export_to_litertlm`` rejects ``separate_vision_encoder=True`` for
-    #: them. This flag makes the per-family {baked, separate} support matrix
-    #: readable directly from the spec table -- previously the rejection was
-    #: an implicit ``vision_input_style == "embedded_pixel_values"`` check
-    #: buried in ``export.py``; declaring the capability explicitly (rather
-    #: than re-deriving it from the input style) is the same spec-over-
-    #: inference migration ``vision_input_style``/``audio_input_style``/
-    #: ``flatten_image_batch`` already made. (Only consulted when
-    #: ``get_vision_config`` returns non-``None``; text-only families keep the
-    #: permissive default, which is inert for them.)
+    #: Whether this family supports the separate-vision-encoder export path.
+    #: ``False`` for families whose encoder runs inside the backbone
+    #: (Gemma3n): there is no separable encoder to export.
     supports_separate_vision = True
 
     # -- Cache / vision / audio config -----------------------------------
@@ -399,16 +265,10 @@ class LiteRTLMExportSpec:
     def describe_unsupported_cache_structure(self):
         """Explain why ``cache_structure`` isn't ``"single_stacked"``.
 
-        Used by ``export_to_litertlm``'s fail-fast check (raised right
-        after the spec is resolved, before any cache-config derivation or
-        tracing) when ``self.cache_structure != "single_stacked"``. Default:
-        a generic description naming the actual ``cache_structure`` value
-        and the shape the adapter does support. Families with a more
-        specific/helpful explanation of *why* their cache doesn't fit (e.g.
-        ``Qwen3_5Spec``, whose hybrid attention/linear-attention layers need
-        a genuinely different, non-KV-only cache) should override this
-        instead of the generic validation in ``export.py`` growing another
-        family-specific branch.
+        Used by ``export_to_litertlm``'s fail-fast check. Default: a
+        generic description naming the actual ``cache_structure`` value and
+        the shape the adapter does support; families with a more specific
+        explanation (e.g. ``Qwen3_5Spec``) override this.
         """
         return (
             f"requires a {self.cache_structure!r} cache structure, "
@@ -430,9 +290,8 @@ class LiteRTLMExportSpec:
 
         image_size = getattr(backbone, "image_size", None)
         if image_size is None:
-            # Gemma3n does not set backbone.image_size; read from the
-            # preprocessor image converter first, then fall back to the
-            # encoder config.
+            # Gemma3n does not set backbone.image_size; read the
+            # preprocessor image converter, then the encoder config.
             image_converter = getattr(preprocessor, "image_converter", None)
             if image_converter is not None:
                 image_size = getattr(image_converter, "image_size", None)
@@ -450,9 +309,8 @@ class LiteRTLMExportSpec:
                 "`preprocessor.image_converter.image_size`, and "
                 "`backbone.vision_encoder_config.image_shape[0]`."
             )
-        # Image converters may report a (height, width) tuple; downstream
-        # code currently assumes a square image, so use the height as the
-        # size.
+        # Image converters may report a (height, width) tuple; use the
+        # height (downstream assumes a square image).
         if isinstance(image_size, (list, tuple)):
             image_size = image_size[0]
 
@@ -460,15 +318,12 @@ class LiteRTLMExportSpec:
             backbone, "num_vision_tokens_per_image", None
         )
         if num_vision_tokens_per_image is None:
-            # PaliGemma exposes the per-image token count via
-            # ``image_sequence_length`` rather than
-            # ``num_vision_tokens_per_image``.
+            # PaliGemma exposes the count as ``image_sequence_length``.
             num_vision_tokens_per_image = getattr(
                 backbone, "image_sequence_length", None
             )
         if num_vision_tokens_per_image is None and preprocessor is not None:
-            # Gemma3/Gemma3n expose the per-image token count on the
-            # preprocessor.
+            # Gemma3/Gemma3n expose the count on the preprocessor.
             num_vision_tokens_per_image = getattr(
                 preprocessor, "num_vision_tokens_per_image", None
             )
@@ -538,22 +393,17 @@ class LiteRTLMExportSpec:
         """Return the projected vision feature dimension."""
         dim = getattr(vision_encoder, "output_dim", None)
         if dim is None:
-            # PaliGemma's ViT uses ``num_classes`` as the projected vision
-            # dimension instead of ``output_dim``.
+            # PaliGemma's ViT names the projected dimension ``num_classes``.
             dim = getattr(vision_encoder, "num_classes", None)
         return dim
 
     def get_max_images_per_prompt(self, preprocessor):
         """Return the max images the runtime may pass per prompt.
 
-        Read from ``preprocessor.max_images_per_prompt`` for multi-image
-        families. Families whose preprocessor does not define it are
-        single-image by construction (PaliGemma: its ViT takes one image and
-        its preprocessor has no ``max_images_per_prompt`` attribute at all),
-        which the ``flatten_image_batch`` spec flag already declares -- so a
-        missing attribute is only valid when ``flatten_image_batch`` is True.
-        A missing attribute on a multi-image (``flatten_image_batch=False``)
-        family is a real misconfiguration and must not silently default to 1.
+        Read from ``preprocessor.max_images_per_prompt``. A missing
+        attribute is only valid for single-image families
+        (``flatten_image_batch=True``, e.g. PaliGemma); on a multi-image
+        family it is a misconfiguration and must not silently default to 1.
         """
         max_images = getattr(preprocessor, "max_images_per_prompt", None)
         if max_images is not None:
@@ -575,11 +425,7 @@ class LiteRTLMExportSpec:
         """Populate vision-related fields in the ``LlmMetadata`` protobuf.
 
         Default: no-op. Text-only families and families without a dedicated
-        ``LlmModelType`` vision subtype (e.g. generic_model, qwen3) do not
-        get vision metadata populated, matching today's behavior. PaliGemma
-        has no vision subtype either, but opts out explicitly on
-        ``PaliGemmaSpec`` because ``GemmaSpec`` carries the gemma3-family
-        population shared by ``Gemma3Spec``/``Gemma3nSpec``.
+        ``LlmModelType`` vision subtype populate nothing.
         """
         del meta, vision_cfg
 
@@ -593,16 +439,10 @@ class LiteRTLMExportSpec:
     def populate_function_gemma_metadata(self, meta):
         """Populate function-calling fields in the ``LlmMetadata`` protobuf.
 
-        Default: no-op. Only ``FunctionGemmaSpec`` (the
-        ``function_gemma_instruct_270m`` preset) overrides this to fill the
-        ``FunctionGemma`` proto's function-calling fields; every other family
-        leaves the field block untouched. Called by ``_build_llm_metadata``
-        right after the ``llm_model_type`` oneof is selected -- the same
-        base-no-op convention ``populate_vision_metadata`` /
-        ``populate_audio_metadata`` use -- except when ``llm_model_type`` was
-        an explicit caller override, mirroring litert-torch skipping its
-        model-specific metadata builder on override
-        (``export_hf/core/litert_lm_builder.py`` ~296).
+        Default: no-op; only ``FunctionGemmaSpec`` overrides this. Called by
+        ``_build_llm_metadata`` except when ``llm_model_type`` was an
+        explicit caller override (mirroring litert-torch, which skips its
+        model-specific metadata builder on override).
         """
         del meta
 
@@ -632,73 +472,19 @@ class LiteRTLMExportSpec:
         return {}
 
     # -- KV-cache stack/unstack ---------------------------------------------
-    #
-    # Cache *layout* (the per-layer tensor shape, see ``cache_layout``) and
-    # cache *structure* (what ``call_with_cache`` expects as its ``cache``
-    # argument overall, see ``cache_structure``) are already per-family spec
-    # facts. Stacking/unstacking between the flat ``kv_cache_k_N``/
-    # ``kv_cache_v_N`` tensors LiteRT-LM's signature contract uses and
-    # whatever shape ``call_with_cache`` actually expects is therefore also
-    # family-specific behavior, not a fixed adapter mechanism -- these two
-    # methods are what a future ``cache_structure="hybrid"`` family (this is
-    # exactly the seam Qwen3.5's hybrid ``(kv_cache, conv_cache,
-    # recurrent_cache)`` cache needs -- see ``Qwen3_5Spec``) would override,
-    # instead of ``KerasHubLiteRTAdapter`` growing per-family branches.
-    #
-    # INVESTIGATION (2026-07-03, keras-hub PR #2705 review, item 7 --
-    # decode-path KV-cache copy cost): traced a tiny Gemma decode step
-    # (num_layers=4, cache_length=16, num_kv_heads=1, head_dim=8; per-layer
-    # per-k/v-tensor size P = cache_length * num_kv_heads * head_dim = 128
-    # elements) with ``torch.export`` and inspected the graph for
-    # ``stack``/``cat`` nodes on cache-sized tensors:
-    #
-    # - ``stack_kv_cache`` itself produces exactly 3 ``torch.stack`` nodes
-    #   per decode step: ``k_stack``/``v_stack`` (``num_layers * P`` = 512
-    #   elements each) plus the final ``stack([k_stack, v_stack])`` combine
-    #   (``2 * num_layers * P`` = 1024 elements). Total elements written:
-    #   ``4 * num_layers * P`` = 2048 -- i.e. **2x** the logical KV-cache
-    #   size (``2 * num_layers * P`` = 1024) is copied here per decode
-    #   step, purely to convert the flat per-layer ``kv_cache_k_N``/
-    #   ``kv_cache_v_N`` signature contract into the single stacked tensor
-    #   ``call_with_cache`` expects.
-    # - ``unstack_kv_cache`` produced **zero** ``stack``/``cat`` nodes in
-    #   the traced graph (only ``select``/``getitem``), confirming it is
-    #   genuinely view-based with no extra copy, as its docstring claims.
-    # - A further ~2x cache size is copied *inside* ``call_with_cache``
-    #   itself (one ``stack([k, v])`` rebuild per layer after that layer's
-    #   cache update, plus one final stack across all ``num_layers``
-    #   layers' results) -- this is a property of the underlying Keras
-    #   model's own per-layer cache-update mechanism, not something these
-    #   two methods control, so it is out of scope here.
-    #
-    # Net: ~4x the logical KV-cache size is copied via ``stack`` somewhere
-    # in the traced decode graph per generated token -- 2x attributable to
-    # this method, 2x to the underlying model's cache update. For a
-    # production-sized cache (many layers x long cache_length x realistic
-    # head_dim) this is a genuine, per-token-recurring data-movement cost,
-    # not just per-tensor binding overhead. Restructuring it would mean
-    # either changing the LiteRT-LM signature contract (the flat
-    # ``kv_cache_k_N``/``kv_cache_v_N`` naming convention) or Keras cache
-    # internals -- both larger changes than this fix batch's scope, so this
-    # is flagged as a follow-up rather than attempted here.
+    # Converting between the flat signature tensors and the family's
+    # ``call_with_cache`` cache shape is per-family behavior, so it lives on
+    # the spec (a hybrid-cache family overrides these, not the adapter).
 
     def stack_kv_cache(self, kv_cache, num_layers):
         """Stack flat ``kv_cache_k_N``/``kv_cache_v_N`` tensors into the
         cache format ``call_with_cache`` expects for this family.
 
-        Default (every family with ``cache_structure="single_stacked"``):
-        stack into a single ``[batch, num_layers, 2, cache_length,
-        num_kv_heads, head_dim]`` tensor -- exactly what
-        ``KerasHubLiteRTAdapter`` used to build inline before this moved
-        onto the spec. ``torch.stack`` always allocates a new, contiguous
-        tensor -- it never returns a view aliasing its inputs -- so the
-        doubly-nested stack below is already guaranteed to be a fresh
-        allocation independent of the per-layer ``kv_cache_k_N``/
-        ``kv_cache_v_N`` input buffers, without an extra ``.clone()``.
-
-        Torch is imported locally (this method is only ever called from the
-        adapter, after the torch backend has already been verified), the
-        same pattern ``Gemma3nSpec.get_forced_call_with_cache_kwargs`` uses.
+        Default: a single ``[batch, num_layers, 2, cache_length,
+        num_kv_heads, head_dim]`` tensor. ``torch.stack`` always allocates
+        a fresh contiguous tensor, so the result never aliases the input
+        buffers and no ``.clone()`` is needed. Torch is imported locally:
+        this method is only called after the torch backend is verified.
         """
         import torch
 
@@ -713,16 +499,11 @@ class LiteRTLMExportSpec:
         ``kv_cache_k_N``/``kv_cache_v_N`` output tensors, inverting
         ``stack_kv_cache``.
 
-        Default: inverse of the single-stacked layout built above. Each
-        per-layer tensor is a view into ``cache``, which is itself already
-        a fresh, non-aliased tensor produced by ``call_with_cache`` (Keras's
-        ``slice_update``/``scatter_update`` cache-update ops are purely
-        functional and never mutate their input in place). No additional
-        ``.clone()`` is needed here: ``torch.export``'s functionalization
-        pass materializes graph-output views into independent buffers
-        automatically, exercised by the full litert_lm-runtime generation
-        tests (multi-step decode, exactly the scenario where aliased output
-        buffers would surface as corrupted generation).
+        Each per-layer tensor is a view into ``cache``, which
+        ``call_with_cache`` already returns freshly allocated (Keras's
+        cache-update ops are purely functional), and ``torch.export``'s
+        functionalization materializes graph-output views into independent
+        buffers -- so no ``.clone()`` is needed.
         """
         outputs = {}
         for i in range(num_layers):
@@ -735,25 +516,12 @@ class LiteRTLMExportSpec:
     def get_chat_stop_token_ids(self, tokenizer):
         """Return extra chat-turn-boundary stop token ids for this family.
 
-        ``_build_llm_metadata`` always adds ``tokenizer.end_token_id`` (the
-        primary EOS used for packing/training) as a stop token. Some
-        families additionally mark the end of a *chat turn* with a second,
-        distinct token that is not ``end_token_id`` -- e.g. Gemma's
-        ``<end_of_turn>`` (see ``GemmaSpec``) or Llama3's ``<|eot_id|>``
-        (see ``Llama3Spec``). Without surfacing that second token, on-device
-        chat generation for those families has no way to know when to stop
-        at a turn boundary (risk of runaway generation).
-
-        Default: none. This covers every family whose primary EOS *is*
-        already the chat-turn-stop token -- e.g. Qwen3's ``<|im_end|>`` is
-        already ``tokenizer.end_token_id`` (see ``Qwen3Tokenizer``), so no
-        override is needed there for that reason (``Qwen3FamilySpec`` still
-        overrides this to make that fact explicit rather than incidental --
-        see below).
-
-        Callers must not assume the returned ids are disjoint from
-        ``end_token_id``; ``_build_llm_metadata`` de-duplicates before
-        writing ``meta.stop_tokens``.
+        ``_build_llm_metadata`` always adds ``tokenizer.end_token_id`` as a
+        stop token; families that mark the end of a *chat turn* with a
+        distinct second token (Gemma's ``<end_of_turn>``, Llama3's
+        ``<|eot_id|>``) override this so on-device chat generation can stop
+        at turn boundaries. Default: none. Returned ids need not be
+        disjoint from ``end_token_id``; the caller de-duplicates.
         """
         del tokenizer
         return []
@@ -764,16 +532,10 @@ class LiteRTLMExportSpec:
         """Return this family's end-of-image token id(s), or ``None``.
 
         Used only by the separate-vision-encoder export path to decide
-        whether to build and bundle an ``END_OF_VISION`` model (see
-        ``end_of_vision_token`` above for the upstream-parity rationale).
-        Returns ``None`` -- not a wrong id -- whenever the family declares no
-        EOI token, or the declared token string cannot be resolved to a real
-        (non-unknown) id in *tokenizer*'s vocabulary, so the caller can skip
-        the section instead of ever bundling an embedding for the wrong
-        token: a missing ``END_OF_VISION`` section is a no-op omission, but
-        one built from a resolved-to-unk id would silently ship an
-        incorrect embedding under a section the runtime is expected to
-        trust.
+        whether to bundle an ``END_OF_VISION`` model. Returns ``None`` --
+        never a wrong, unk-resolved id -- when the family declares no EOI
+        token or the tokenizer cannot resolve it, so the caller skips the
+        section instead of bundling an incorrect embedding.
         """
         if self.end_of_vision_token is None:
             return None
@@ -818,25 +580,18 @@ def _gemma_family_chat_stop_token_ids(tokenizer):
 class GemmaSpec(LiteRTLMExportSpec):
     """Base Gemma (Gemma/Gemma2) family.
 
-    Not registered with its own dedicated ``LlmModelType`` subtype (there is
-    no "gemma" oneof field distinct from "gemma3"/"gemma3n"/"gemma4"), so
-    ``model_type`` stays the ``LiteRTLMExportSpec`` default of
-    ``"generic_model"``, matching today's behavior. Registered explicitly so
-    the Gemma-family ``<end_of_turn>`` chat-stop-token convention (shared
-    with ``Gemma3Spec``/``Gemma3nSpec``/``Gemma4Spec``/``PaliGemmaSpec``
-    below, all of which subclass this instead of ``LiteRTLMExportSpec``
-    directly) lives on the registry instead of as an unconditional check in
-    ``_build_llm_metadata`` that happened to no-op for non-Gemma tokenizers
-    only because they don't have ``<end_of_turn>`` in vocab.
+    There is no dedicated ``LlmModelType`` subtype for base Gemma, so
+    ``model_type`` stays ``"generic_model"``. Provides the Gemma-family
+    ``<end_of_turn>`` chat-stop-token convention shared by every Gemma*
+    spec below (all subclass this instead of ``LiteRTLMExportSpec``).
     """
 
     def get_chat_stop_token_ids(self, tokenizer):
         return _gemma_family_chat_stop_token_ids(tokenizer)
 
     def populate_vision_metadata(self, meta, vision_cfg):
-        # Shared by the gemma3/gemma3n `LlmModelType` subtypes, which carry
-        # the same image-token fields; `self.model_type` selects the
-        # subtype. FunctionGemma, Gemma4, and PaliGemma override this.
+        # Shared by the gemma3/gemma3n subtypes, which carry the same
+        # image-token fields; FunctionGemma, Gemma4, PaliGemma override this.
         _populate_gemma3_family_vision_metadata(
             meta, self.model_type, vision_cfg
         )
@@ -844,9 +599,7 @@ class GemmaSpec(LiteRTLMExportSpec):
 
 class Gemma3Spec(GemmaSpec):
     model_type = "gemma3"
-    #: See ``LiteRTLMExportSpec.end_of_vision_token``. Reuses the same
-    #: string already used for ``LlmModelType.gemma3.end_of_image_token``
-    #: below, rather than a second literal.
+    #: Same string as ``LlmModelType.gemma3.end_of_image_token``.
     end_of_vision_token = _GEMMA3_END_OF_IMAGE_TOKEN
 
 
@@ -854,57 +607,34 @@ class FunctionGemmaSpec(Gemma3Spec):
     """The ``function_gemma_instruct_270m`` preset.
 
     Architecturally identical to Gemma3 -- it loads as a plain
-    ``Gemma3CausalLM`` (its preset entry uses ``"path": "gemma3"``) -- so it
-    cannot be distinguished by ``isinstance`` in ``resolve_export_spec`` or by
-    a config ``model_type`` field (keras-hub's Gemma3 config has none). It is
-    reached either explicitly -- via ``export_to_litertlm``'s
-    ``llm_model_type="function_gemma"`` override, mirroring litert-torch's own
-    ``litert_lm_model_type_override`` for the same
-    architecturally-indistinguishable case
-    (``export_hf/core/litert_lm_builder.py``) -- or by tokenizer
-    auto-detection (``_is_function_gemma``), which recognizes the
-    function-calling special tokens in its vocabulary. Emitting
-    ``model_type = "function_gemma"`` maps it to the
-    ``LlmMetadata.llm_model_type`` ``function_gemma`` oneof (a
-    ``FunctionGemma`` proto) instead of ``gemma3``, preserving the
-    function-calling metadata that a plain Gemma3 export silently drops
-    (I-3b).
+    ``Gemma3CausalLM`` -- so it cannot be distinguished by ``isinstance``
+    or config. It is reached via the explicit
+    ``llm_model_type="function_gemma"`` override (mirroring litert-torch's
+    ``litert_lm_model_type_override``) or by tokenizer auto-detection
+    (``_is_function_gemma``). ``model_type = "function_gemma"`` maps it to
+    the ``FunctionGemma`` proto instead of ``gemma3``, preserving the
+    function-calling metadata a plain Gemma3 export would silently drop.
 
-    Deliberately NOT registered in ``_EXPORT_SPEC_REGISTRY``: since it is a
-    plain ``Gemma3CausalLM``, an ``isinstance`` entry would shadow
-    ``Gemma3Spec`` for *every* Gemma3 model. Reachability is limited to the
-    explicit override (see ``_MODEL_TYPE_OVERRIDE_SPECS``) and the tokenizer
-    auto-detection above.
+    Deliberately NOT registered in ``_EXPORT_SPEC_REGISTRY``: an
+    ``isinstance`` entry would shadow ``Gemma3Spec`` for *every* Gemma3
+    model.
     """
 
     model_type = "function_gemma"
 
     def populate_vision_metadata(self, meta, vision_cfg):
-        # function_gemma is a text-only preset; the active ``llm_model_type``
-        # oneof is ``function_gemma`` (a ``FunctionGemma`` proto with no image
-        # fields), so the gemma3-family vision population inherited from
-        # ``GemmaSpec`` must not run here. In practice ``vision_cfg`` is
-        # always ``None`` for this text-only preset, so
-        # ``_build_llm_metadata`` never even calls this; overridden to the
-        # base no-op defensively.
+        # The ``FunctionGemma`` proto has no image fields, so the gemma3-
+        # family vision population inherited from ``GemmaSpec`` must not run.
         del meta, vision_cfg
 
     def populate_function_gemma_metadata(self, meta):
         """Populate the ``FunctionGemma`` function-calling proto fields.
 
-        Mirrors the fields litert-torch's Gemma4 metadata builder populates
-        for its own function-calling support
-        (``export_hf/model_ext/gemma4/metadata_builder.py`` ~39-54):
-        code-fence start/end, open/close quote, function-response start, and
-        the use-template-for-function-call-format flag. ``FunctionGemma`` shares
-        Gemma4's exact function-calling field block (proto field numbers
-        5-14). keras-hub supplies the fence strings as spec constants because
-        its Gemma3 tokenizer, unlike the HuggingFace checkpoint litert-torch
-        reads, has no ``special_tokens_map`` carrying them.
-
-        ``constraint_mode`` is left at its proto default
-        (``CONSTRAINT_MODE_UNSPECIFIED``): litert-torch's Gemma4 builder does
-        not set it, and the scope here is to mirror that builder.
+        Mirrors litert-torch's Gemma4 metadata builder
+        (``export_hf/model_ext/gemma4/metadata_builder.py``), whose
+        function-calling field block ``FunctionGemma`` shares (proto fields
+        5-14). ``constraint_mode`` is left at its proto default, as upstream
+        leaves it.
         """
         subtype = meta.llm_model_type.function_gemma
         subtype.code_fence_start = _FUNCTION_GEMMA_CODE_FENCE_START
@@ -922,10 +652,7 @@ class Gemma3nSpec(GemmaSpec):
     cache_layout = "gemma3n"
     vision_input_style = "embedded_pixel_values"
     audio_input_style = "embedded_mel"
-    #: Gemma3n runs its vision encoder inside the backbone (see
-    #: ``vision_input_style`` above), so there is no standalone encoder to
-    #: pack as a separate bundle section. See
-    #: ``LiteRTLMExportSpec.supports_separate_vision``.
+    #: The encoder runs inside the backbone; no standalone encoder to pack.
     supports_separate_vision = False
 
     def get_kv_cache_sample_shape(
@@ -945,11 +672,9 @@ class Gemma3nSpec(GemmaSpec):
         subtype.end_of_audio_token.token_str = _AUDIO_END_TOKEN
 
     def get_forced_call_with_cache_kwargs(self, tokens, cache_length):
-        # Gemma3n's attention mask computation requires the padding mask to
-        # span the full cache length, otherwise a seq_len shorter than
-        # cache_length causes a broadcasting error between the causal and
-        # padding masks. During export we always pass full-length valid
-        # tokens, so a ones mask of cache length is correct.
+        # Gemma3n's attention-mask computation requires a full-cache-length
+        # padding mask (a shorter one mis-broadcasts against the causal
+        # mask); export passes full-length valid tokens, so ones is correct.
         import torch
 
         return {
@@ -965,9 +690,7 @@ class Gemma4Spec(GemmaSpec):
     model_type = "gemma4"
     vision_input_style = "patch_values"
     audio_input_style = "standalone_mel"
-    #: See ``LiteRTLMExportSpec.end_of_vision_token``. Reuses the same
-    #: string already used for ``LlmModelType.gemma4.end_of_image_token``
-    #: below, rather than a second literal.
+    #: Same string as ``LlmModelType.gemma4.end_of_image_token``.
     end_of_vision_token = _GEMMA4_END_OF_IMAGE_TOKEN
 
     def populate_vision_metadata(self, meta, vision_cfg):
@@ -984,40 +707,15 @@ class Gemma4Spec(GemmaSpec):
             subtype.pooling_kernel_size = pool_size
 
     def populate_audio_metadata(self, meta, audio_cfg):
-        # `audio_cfg` (max_clips_per_prompt / num_frames / num_audio_tokens /
-        # audio_input_feat_size, from `get_audio_config`) is used only to
-        # size the audio trace inputs during export -- the installed
-        # litert-lm-builder 0.13.0 `Gemma4` LlmModelType subtype has no proto
-        # fields to carry those derived values, so they are intentionally
-        # not forwarded here.
+        # The gemma4 subtype has no proto fields for the derived `audio_cfg`
+        # values; they only size the audio trace inputs, so not forwarded.
         del audio_cfg
         subtype = meta.llm_model_type.gemma4
         subtype.start_of_audio_token.token_str = _AUDIO_START_TOKEN
         subtype.end_of_audio_token.token_str = _AUDIO_END_TOKEN
-        # `skip_mel_spectrogram_extraction=False` tells the LiteRT-LM
-        # runtime's audio preprocessor to PERFORM mel-spectrogram extraction
-        # and hand the bundle a log-mel spectrogram. This matches
-        # keras-hub's Gemma4 export contract: `Gemma4AudioConverter` already
-        # produces log-mel features on the host side, and the exported
-        # trace feeds that `audio_mel` straight into
-        # `backbone.audio_encoder` (see
-        # `KerasHubLiteRTAdapter._prepare_audio_embeddings` in
-        # adapter.py), so the runtime must not skip extraction (`True`
-        # would feed framed raw PCM instead of mel). Direction confirmed
-        # against the runtime consumer of this flag, ai-edge-litert's
-        # `AudioPreprocessorMiniAudio::Preprocess`
-        # (support/preprocessor/audio_preprocessor_miniaudio.cc:351): `if
-        # (!SkipMelSpectrogramExtraction())` runs STFT + log-mel extraction,
-        # the `else` branch emits framed raw PCM instead (confirmed by
-        # `audio_preprocessor_miniaudio_test.cc`'s
-        # `SkipMelSpectrogramExtraction` test, which asserts the output
-        # equals the raw PCM frames). Field docstring:
-        # support/preprocessor/audio_preprocessor.h:177 ("Whether to skip
-        # the Mel spectrogram extraction."). NOTE: `False` is also the
-        # proto3 default for this scalar bool (no field presence on this
-        # type), so this assignment does not change the serialized bytes --
-        # it is an explicit statement of the contract, and a regression
-        # guard against a future flip to `True`.
+        # `skip_mel_spectrogram_extraction=False` makes the runtime perform
+        # mel extraction (`True` feeds raw PCM): the trace consumes log-mel
+        # `audio_mel`. Also the proto3 default -- an explicit regression guard.
         subtype.skip_mel_spectrogram_extraction = False
 
     def reshape_separate_vision_embeddings(
@@ -1025,10 +723,9 @@ class Gemma4Spec(GemmaSpec):
     ):
         if img_embeddings is None:
             return None
-        # Gemma4 interleaves image embeddings with shape
-        # (batch, num_images, tokens_per_image, hidden_dim). The separate
-        # vision encoder/adapter produces a flat (batch*num_images, ...)
-        # tensor, so reshape it back before passing to the language model.
+        # The separate vision encoder/adapter flattens Gemma4's interleaved
+        # (batch, num_images, tokens_per_image, hidden_dim) embeddings to
+        # (batch*num_images, ...); reshape back before the language model.
         max_images = self.get_max_images_per_prompt(preprocessor)
         batch_size = tokens.shape[0]
         return img_embeddings.reshape(
@@ -1075,37 +772,26 @@ class PaliGemmaSpec(GemmaSpec):
     a Gemma tokenizer and shares the same ``<end_of_turn>`` convention.
     """
 
-    #: PaliGemma's ViT accepts one image at a time (4-D input); the adapter
-    #: flattens the batched images stack before calling it. See
-    #: ``LiteRTLMExportSpec.flatten_image_batch``.
+    #: PaliGemma's ViT accepts one image at a time (4-D input).
     flatten_image_batch = True
 
-    # `end_of_vision_token` stays the `LiteRTLMExportSpec` default of `None`:
-    # PaliGemma's preprocessor/tokenizer define no end-of-image special
-    # token (unlike Gemma3/Gemma4's `end_of_image_token`), so there is no
-    # real token string to declare here -- a separate-vision PaliGemma
-    # export emits no `END_OF_VISION` section, matching its existing
-    # metadata-vacuum documented above (no dedicated `LlmModelType` subtype
-    # either).
+    # `end_of_vision_token` stays `None`: PaliGemma defines no end-of-image
+    # special token, so separate-vision emits no `END_OF_VISION` section.
 
     def populate_vision_metadata(self, meta, vision_cfg):
-        # PaliGemma has no dedicated `LlmModelType` vision subtype (see the
-        # class docstring), so the gemma3-family population inherited from
-        # `GemmaSpec` must not run here; keep the base no-op.
+        # No dedicated `LlmModelType` vision subtype, so the gemma3-family
+        # population inherited from `GemmaSpec` must not run here.
         del meta, vision_cfg
 
 
 class Llama3Spec(LiteRTLMExportSpec):
     """Llama3's chat template ends a turn with ``<|eot_id|>``.
 
-    ``Llama3Tokenizer`` stores this as the secondary special token
-    ``end_token2`` (see the "Hack" comment in ``llama3_tokenizer.py``):
-    Llama3 checkpoints have no config indicating whether the true stop
-    token is ``<|end_of_text|>`` or ``<|eot_id|>``, so the tokenizer
-    registers both, but the packer always uses ``<|end_of_text|>``
-    (``tokenizer.end_token_id``) as the primary EOS. Without this override,
-    ``<|eot_id|>`` never reaches the exported metadata, so on-device chat
-    generation has no way to know when to stop at a turn boundary.
+    ``Llama3Tokenizer`` registers both ``<|end_of_text|>`` (the primary EOS,
+    ``end_token_id``) and ``<|eot_id|>`` (as the secondary ``end_token2``)
+    because checkpoints have no config indicating the true stop token.
+    Without this override, ``<|eot_id|>`` never reaches the exported
+    metadata, so on-device chat generation cannot stop at a turn boundary.
     """
 
     def get_chat_stop_token_ids(self, tokenizer):
@@ -1116,17 +802,11 @@ class Llama3Spec(LiteRTLMExportSpec):
 class Phi3Spec(LiteRTLMExportSpec):
     """Phi-3's chat template ends every turn with ``<|end|>``.
 
-    Phi-3's chat template wraps each turn as ``<|role|>\\n{content}<|end|>\\n``
-    (HF ``microsoft/Phi-3-mini-4k-instruct`` ``tokenizer_config.json``), so
-    ``<|end|>`` -- distinct from the primary EOS ``<|endoftext|>`` -- is the
-    chat-turn-boundary token. ``Phi3Tokenizer`` registers ``<|endoftext|>``
-    as ``end_token`` (the packing/training EOS, see ``phi3_tokenizer.py``),
-    so ``<|end|>`` never reaches the exported metadata without this
-    override, leaving on-device chat generation no way to stop at a turn
-    boundary. ``<|end|>`` is an ordinary special token in the vocab (not a
-    named tokenizer attribute), so look it up by string; return ``[]`` when
-    it is absent (base/non-instruct Phi-3 vocabularies) so the override
-    never invents a token that isn't there.
+    ``<|end|>`` is distinct from the primary EOS ``<|endoftext|>`` (what
+    ``Phi3Tokenizer`` registers as ``end_token``), so it never reaches the
+    exported metadata without this override. It is an ordinary special
+    token in the vocab, so look it up by string and return ``[]`` when it
+    is absent (base/non-instruct vocabularies).
     """
 
     def get_chat_stop_token_ids(self, tokenizer):
@@ -1135,30 +815,9 @@ class Phi3Spec(LiteRTLMExportSpec):
 
 
 # -- Text families with no distinct chat-turn stop token -------------------
-#
-# These families are deliberately NOT given their own spec class or
-# `_EXPORT_SPEC_REGISTRY` entry: they already resolve to the plain
-# `LiteRTLMExportSpec` default (`model_type="generic_model"`,
-# `get_chat_stop_token_ids` -> `[]`, i.e. EOS-only), and that default is
-# already correct for them -- an empty subclass whose override returns `[]`
-# would be dead code restating the default. Recorded here instead, per
-# family, with the source that was checked:
-#
-# - Mistral / Mixtral: EOS-only by design. Their instruct chat template
-#   terminates each turn with the primary EOS `</s>` itself
-#   (`[INST] ... [/INST]</s>`; HF `mistralai/Mistral-7B-Instruct-v0.2`
-#   `tokenizer_config.json`, `additional_special_tokens` empty), not a
-#   distinct chat-turn token. `MistralTokenizer`/`MixtralTokenizer` register
-#   only `<s>`/`</s>` (see their `__init__`) -- no second stop token exists
-#   to surface.
-# - Base Llama (v1/v2): EOS-only by design -- see the `LlamaCausalLM`
-#   registry entry's NOTE below, which already documents this.
-# - GPT2 / Bloom / GPT-NeoX / OPT: EOS-only by design (no chat template --
-#   these are pure base LMs). `GPT2Tokenizer`/`GPTNeoXTokenizer` register
-#   `<|endoftext|>` as both start and end token; `BloomTokenizer` registers
-#   `<s>`/`</s>`/`<pad>`; `OPTTokenizer` registers `</s>` as both start and
-#   end token plus `<pad>`. None have a chat template or a second
-#   chat-turn-boundary token in their tokenizer definitions.
+# These keep the `LiteRTLMExportSpec` default (EOS-only): Mistral/Mixtral
+# end turns with the primary EOS `</s>`; base Llama, GPT2, Bloom, GPT-NeoX
+# and OPT are base LMs with no second chat-turn token in their tokenizers.
 
 
 def _qwen_family_chat_stop_token_ids(tokenizer):
@@ -1177,13 +836,8 @@ class Qwen3FamilySpec(LiteRTLMExportSpec):
     model_type = "qwen3"
 
     def get_chat_stop_token_ids(self, tokenizer):
-        # Qwen3's chat template ends a turn with `<|im_end|>`, which is
-        # already the tokenizer's primary EOS (`tokenizer.end_token_id` --
-        # see `Qwen3Tokenizer.__init__`). This override makes that
-        # intentional rather than an accident of `end_token_id` happening
-        # to already be the right token; `_build_llm_metadata`
-        # de-duplicates against `end_token_id` so this does not add a
-        # redundant entry to the exported metadata.
+        # Qwen3's `<|im_end|>` is already `tokenizer.end_token_id`; surfaced
+        # explicitly (`_build_llm_metadata` de-duplicates).
         return _qwen_family_chat_stop_token_ids(tokenizer)
 
 
@@ -1215,12 +869,8 @@ class Qwen2p5FamilySpec(LiteRTLMExportSpec):
     model_type = "qwen2p5"
 
     def get_chat_stop_token_ids(self, tokenizer):
-        # Unlike Qwen3, `<|im_end|>` is not Qwen (2.5)'s registered
-        # `end_token` (see `QwenTokenizer`/`QwenMoeTokenizer`, which use
-        # `<|endoftext|>`), but ChatML-format instruct checkpoints may still
-        # include `<|im_end|>` in their vocabulary as an ordinary token. Add
-        # it as a chat-stop token when present; do nothing when it is not
-        # (base/non-chat Qwen 2.5 vocabularies).
+        # Qwen 2.5 registers `<|endoftext|>` as `end_token`, but ChatML
+        # checkpoints may still carry `<|im_end|>`; add it when present.
         return _qwen_family_chat_stop_token_ids(tokenizer)
 
 
@@ -1234,18 +884,16 @@ def _populate_gemma3_family_vision_metadata(meta, model_type, vision_cfg):
     subtype.image_tensor_width = image_size
 
 
-# (module_path, class_name, spec_factory). Imported lazily inside
-# ``resolve_export_spec`` to avoid heavy top-level dependencies, the same
-# pattern used by the module-level model-type mapping this replaces.
+# (module_path, class_name, spec_factory), imported lazily inside
+# ``resolve_export_spec`` to avoid heavy top-level dependencies.
 _EXPORT_SPEC_REGISTRY = (
     (
         "keras_hub.src.models.gemma4.gemma4_causal_lm",
         "Gemma4CausalLM",
         Gemma4Spec,
     ),
-    # MTP draft model (subclasses `CausalLM` directly, not `Gemma4CausalLM`),
-    # not standalone-exportable: registered so `check_exportable` fails fast
-    # instead of falling through to the generic spec.
+    # MTP draft model, not standalone-exportable: registered so
+    # `check_exportable` fails fast instead of tracing the generic path.
     (
         "keras_hub.src.models.gemma4.gemma4_assistant_causal_lm",
         "Gemma4AssistantCausalLM",
@@ -1266,11 +914,8 @@ _EXPORT_SPEC_REGISTRY = (
         "PaliGemmaCausalLM",
         PaliGemmaSpec,
     ),
-    # Base Gemma (Gemma/Gemma2) has no dedicated ``LlmModelType`` subtype
-    # (see ``GemmaSpec``), so this entry only exists to give it the shared
-    # Gemma-family ``<end_of_turn>`` chat-stop-token behavior instead of
-    # silently falling through to the plain ``LiteRTLMExportSpec`` default
-    # (which has no chat-stop-token override).
+    # Registered (despite no dedicated ``LlmModelType`` subtype) so base
+    # Gemma gets the shared Gemma-family ``<end_of_turn>`` behavior.
     (
         "keras_hub.src.models.gemma.gemma_causal_lm",
         "GemmaCausalLM",
@@ -1286,12 +931,8 @@ _EXPORT_SPEC_REGISTRY = (
         "Qwen3CausalLM",
         Qwen3FamilySpec,
     ),
-    # NOTE: LlmModelType does not have a dedicated "qwen3_5" field. Qwen3.5
-    # is architecturally a Qwen3 variant (hybrid attention decoder in the
-    # same family), so it maps to the "qwen3" oneof, matching
-    # Qwen3MoeCausalLM above. It gets its own spec class (rather than
-    # reusing Qwen3FamilySpec directly) because its hybrid cache structure
-    # is not yet supported by the adapter -- see `Qwen3_5Spec`.
+    # NOTE: no dedicated "qwen3_5" LlmModelType field; maps to "qwen3". Own
+    # spec class because its hybrid cache is not yet supported.
     (
         "keras_hub.src.models.qwen3_5.qwen3_5_causal_lm",
         "Qwen3_5CausalLM",
@@ -1307,21 +948,15 @@ _EXPORT_SPEC_REGISTRY = (
         "QwenCausalLM",
         Qwen2p5FamilySpec,
     ),
-    # Llama3CausalLM is a subclass of LlamaCausalLM, so its entry must come
-    # first (registry order + isinstance first-match-wins) to get
-    # ``Llama3Spec``'s ``<|eot_id|>`` chat-stop-token override instead of
-    # falling through to the plain ``LlamaCausalLM`` entry below.
+    # Llama3CausalLM subclasses LlamaCausalLM, so its entry must come first
+    # (first match wins) to get ``Llama3Spec``'s ``<|eot_id|>`` override.
     (
         "keras_hub.src.models.llama3.llama3_causal_lm",
         "Llama3CausalLM",
         Llama3Spec,
     ),
-    # NOTE: LlmModelType does not have a dedicated "llama" field; map Llama
-    # checkpoints to generic_model so the protobuf oneof stays valid. (This
-    # is also the ``LiteRTLMExportSpec`` default, so this entry only exists
-    # to make the mapping explicit/greppable.) Base Llama (v1/v2) uses a
-    # plain SentencePiece EOS with no secondary chat-stop token, so it does
-    # not need its own spec class the way ``Llama3Spec`` does.
+    # NOTE: no dedicated "llama" LlmModelType field; map to generic_model
+    # (the default -- explicit for greppability). No chat-stop token needed.
     (
         "keras_hub.src.models.llama.llama_causal_lm",
         "LlamaCausalLM",
@@ -1335,46 +970,18 @@ _EXPORT_SPEC_REGISTRY = (
 )
 
 # -- Deferred / not-yet-decided chat-stop-token cases -----------------------
-#
-# - SmolLM3: the real HF SmolLM3 (`HuggingFaceTB/SmolLM3-3B`) uses a ChatML
-#   template that terminates turns with `<|im_end|>` (id 128012), distinct
-#   from its EOS `<|end_of_text|>` (id 128001). But keras-hub's
-#   `SmolLM3Tokenizer` does not register `<|im_end|>` at all (only
-#   `<|end_of_text|>` as `end_token`, plus `<|begin_of_text|>`, `<think>`,
-#   `</think>` -- see `smollm3_tokenizer.py`), and no keras-hub SmolLM3
-#   tokenizer vocabulary (including the test fixture) contains that token.
-#   A `_lookup_token_id(tokenizer, "<|im_end|>")` override would therefore
-#   be a silent no-op for every keras-hub SmolLM3 tokenizer -- an override
-#   that reads as if it does something but never fires. Left EOS-only
-#   (default `LiteRTLMExportSpec`, no spec class) until the tokenizer is
-#   taught to register `<|im_end|>`; revisit then (Future Work).
-# - GPT-OSS: harmony-format stop-token choice remains a genuine judgment
-#   trap independent of export status (export itself is unblocked -- see
-#   `gpt_oss_causal_lm_test.py::test_litertlm_export`, no xfail).
-#   `GptOssTokenizer` registers only `<|endoftext|>` as `end_token`
-#   (`gpt_oss_tokenizer.py`);
-#   the harmony-format tokens `<|return|>`/`<|end|>`/`<|call|>` are not
-#   registered as named attributes, and choosing which one is "the"
-#   chat-turn stop requires harmony role/channel semantics (end-of-message
-#   vs end-of-turn vs tool-call boundary) that keras-hub does not encode
-#   anywhere. Picking wrong ships an incorrect stop token to on-device
-#   generation. Deferred; left EOS-only (default spec, no override) until a
-#   harmony-format-aware decision is made (Future Work).
-# - Falcon: export-blocked (tracked separately, see
-#   `falcon_causal_lm_test.py`'s xfail); no chat-stop-token work attempted
-#   here regardless of its export status.
+# - SmolLM3: HF SmolLM3 ends turns with `<|im_end|>`, but keras-hub's
+#   `SmolLM3Tokenizer` does not register that token, so an override would
+#   never fire. Left EOS-only until the tokenizer registers it.
+# - GPT-OSS: picking a harmony-format stop token (`<|return|>`/`<|end|>`/
+#   `<|call|>`) needs role/channel semantics keras-hub does not encode, and
+#   picking wrong ships an incorrect stop token. Left EOS-only.
+# - Falcon: export-blocked (see `falcon_causal_lm_test.py`'s xfail).
 
 
-# Explicit model-type overrides for presets that are architecturally
-# identical to another family and so cannot be told apart by ``isinstance``
-# or config (see ``FunctionGemmaSpec``). Keyed by the
-# ``llm_model_type`` string a caller passes to ``export_to_litertlm``. Mirrors
-# litert-torch's ``litert_lm_model_type_override``
-# (``export_hf/core/litert_lm_builder.py``). NOTE: these spec classes are
-# deliberately NOT in ``_EXPORT_SPEC_REGISTRY`` -- an ``isinstance`` entry
-# cannot tell them apart from the look-alike family (``FunctionGemmaSpec``
-# would shadow ``Gemma3Spec`` for every Gemma3 model). They are reached via
-# this override or tokenizer auto-detection (``_is_function_gemma``).
+# Explicit model-type overrides for presets architecturally identical to
+# another family (see ``FunctionGemmaSpec``), keyed by ``llm_model_type``.
+# NOT in ``_EXPORT_SPEC_REGISTRY``: an entry would shadow the look-alike.
 _MODEL_TYPE_OVERRIDE_SPECS = {
     "function_gemma": FunctionGemmaSpec,
 }

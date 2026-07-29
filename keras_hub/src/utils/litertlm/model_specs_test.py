@@ -1,18 +1,3 @@
-"""Registry-integrity tests for `model_specs.py`'s `_EXPORT_SPEC_REGISTRY`.
-
-These tests are intentionally dependency-free -- no torch, no litert-torch,
-no litert-lm-builder -- so they run on every backend/CI leg, not just the
-torch-backend leg the rest of the litertlm test suite is gated on (see
-`export_test.py`, `qwen3_5_causal_lm_test.py`). `model_specs.py` itself has no
-external imports at module level, and `resolve_export_spec` only attempts to
-import the actual model classes it checks `isinstance` against, swallowing
-`ImportError` per entry -- correct/necessary at runtime, since many entries
-reference optional model classes, but it also means a typo'd `module_path` or
-`class_name` in `_EXPORT_SPEC_REGISTRY` would silently make that family
-permanently fall back to the generic spec, with nothing catching it. These
-tests catch exactly that.
-"""
-
 import importlib
 import types
 
@@ -470,11 +455,8 @@ class ExportSpecRegistryIntegrityTest(TestCase):
 
     # -- Audio input style --------------------------------------------------
     #
-    # Every audio-capable family (a spec that overrides
-    # `populate_audio_metadata` with real audio tokens) must also declare an
-    # `audio_input_style` so the adapter dispatches on the spec instead of
-    # sniffing `call_with_cache`'s signature. This is the audio analogue of
-    # `vision_input_style` and mirrors the migration vision already got.
+    # Every audio-capable family must declare an `audio_input_style`
+    # matching how its encoder consumes input.
 
     def test_audio_capable_specs_declare_audio_input_style(self):
         """Gemma3n and Gemma4 are the only audio-capable families; each must
@@ -498,7 +480,7 @@ class ExportSpecRegistryIntegrityTest(TestCase):
     def test_single_image_family_declares_flatten_image_batch(self):
         """PaliGemma's ViT is 4-D-only; its spec must declare
         flatten_image_batch=True so the adapter flattens the batched images
-        stack instead of sniffing the encoder's Functional input rank."""
+        stack before calling it."""
         self.assertTrue(PaliGemmaSpec().flatten_image_batch)
 
     def test_multi_image_families_do_not_flatten(self):
@@ -524,20 +506,15 @@ class ExportSpecRegistryIntegrityTest(TestCase):
     def test_max_images_missing_on_multi_image_family_raises(self):
         """A multi-image (flatten_image_batch=False) family with no
         max_images_per_prompt is a misconfiguration -- must raise, not
-        silently default to 1 (the old getattr(..., 1) behavior)."""
+        silently default to 1."""
         pre = types.SimpleNamespace()  # no max_images_per_prompt attribute
         with self.assertRaisesRegex(ValueError, "flatten_image_batch=False"):
             Gemma4Spec().get_max_images_per_prompt(pre)
 
-    # -- allows_vision_bucketing (family-wide bucketing ban, V-7) -----------
+    # -- allows_vision_bucketing --------------------------------------------
     #
-    # The multimodal export path currently requires every prefill bucket to
-    # equal cache_length. That ban is enforced family-wide via this flag
-    # defaulting to False on every spec (see the bucketing check in
-    # `export.py`), NOT as a Gemma3-specific rule -- these tests lock the
-    # default so a future per-family relaxation is a deliberate, visible
-    # one-line `allows_vision_bucketing = True` override, and catch an
-    # accidental early flip.
+    # These tests lock the family-wide default (False) so a per-family
+    # relaxation is a deliberate, visible one-line override.
 
     def test_all_vision_families_disallow_bucketing_by_default(self):
         """Every vision-capable family inherits allows_vision_bucketing=False,
@@ -557,18 +534,14 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         self.assertFalse(LiteRTLMExportSpec().allows_vision_bucketing)
         self.assertFalse(GemmaSpec().allows_vision_bucketing)
 
-    # -- supports_separate_vision (baked/separate matrix, V-6) --------------
+    # -- supports_separate_vision --------------------------------------------
     #
-    # The separate-vision-encoder export path is allowed for every vision
-    # family except those whose encoder runs inside the backbone (Gemma3n).
-    # This capability is declared per family on the spec (default True, one
-    # override to False) so the {baked, separate} support matrix is readable
-    # from the spec table rather than reconstructed from a rejection branch
-    # in export.py. These tests lock the matrix so a change is deliberate.
+    # These tests lock the {baked, separate} support matrix so a change is
+    # deliberate.
 
     def test_vision_families_declare_supports_separate_vision(self):
         """Every vision-capable family declares supports_separate_vision
-        explicitly, and its value matches today's support matrix: Gemma3,
+        explicitly, and its value matches the current support matrix: Gemma3,
         Gemma4 and PaliGemma support the separate path; Gemma3n (encoder
         inside the backbone) does not."""
         self.assertTrue(Gemma3Spec().supports_separate_vision)

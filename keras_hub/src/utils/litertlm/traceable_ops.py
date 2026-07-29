@@ -308,13 +308,9 @@ def _patched_take(x, indices, axis=None):
         indices,
     )
     if x.ndim == 2 and axis == 0:
-        # ``F.embedding`` documents a float ``weight`` (embedding table), but
-        # empirically it also accepts int32/int64/bool ``x`` and returns a
-        # plain gather with no dtype-related crash, both eagerly and under
-        # ``torch.export`` (verified 2026-07-03 against this repo's PyTorch
-        # version -- see keras-hub PR #2705 review). No dtype guard is
-        # needed here; this comment documents that the case was checked
-        # rather than assumed.
+        # ``F.embedding`` documents a float ``weight`` (embedding table),
+        # but empirically accepts int32/int64/bool ``x`` as a plain gather,
+        # both eagerly and under ``torch.export`` -- no dtype guard needed.
         return torch.nn.functional.embedding(indices, x)
     axis = torch_backend_numpy.canonicalize_axis(axis, x.ndim)
     shape = x.shape[:axis] + indices.shape + x.shape[axis + 1 :]
