@@ -1213,7 +1213,6 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         num_layers = cache_cfg["num_layers"]
         num_kv_heads = cache_cfg["num_kv_heads"]
         head_dim = cache_cfg["head_dim"]
-        cache_layout = cache_cfg["cache_layout"]
 
         vision_cfg = spec.get_vision_config(model)
         audio_cfg = spec.get_audio_config(model)
@@ -1245,7 +1244,6 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             cache_length=cache_length,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            cache_layout=cache_layout,
             prefill_seq_lens=[prefill_seq_len],
             dtype=dtype,
             has_vision=has_vision,

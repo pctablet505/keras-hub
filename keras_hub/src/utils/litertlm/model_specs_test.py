@@ -20,6 +20,10 @@ from keras_hub.src.models.gemma.gemma_backbone import GemmaBackbone
 from keras_hub.src.models.gemma.gemma_causal_lm import GemmaCausalLM
 from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
 from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
+from keras_hub.src.models.gemma4.gemma4_assistant_causal_lm import (
+    Gemma4AssistantCausalLM,
+)
+from keras_hub.src.models.gemma4.gemma4_backbone import Gemma4Backbone
 from keras_hub.src.models.llama.llama_backbone import LlamaBackbone
 from keras_hub.src.models.llama.llama_causal_lm import LlamaCausalLM
 from keras_hub.src.models.llama3.llama3_backbone import Llama3Backbone
@@ -37,6 +41,7 @@ from keras_hub.src.utils.litertlm.model_specs import _EXPORT_SPEC_REGISTRY
 from keras_hub.src.utils.litertlm.model_specs import FunctionGemmaSpec
 from keras_hub.src.utils.litertlm.model_specs import Gemma3nSpec
 from keras_hub.src.utils.litertlm.model_specs import Gemma3Spec
+from keras_hub.src.utils.litertlm.model_specs import Gemma4AssistantSpec
 from keras_hub.src.utils.litertlm.model_specs import Gemma4Spec
 from keras_hub.src.utils.litertlm.model_specs import GemmaSpec
 from keras_hub.src.utils.litertlm.model_specs import LiteRTLMExportSpec
@@ -155,6 +160,34 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         # only does an `isinstance` check, so a null preprocessor is fine.
         return Gemma3CausalLM(preprocessor=None, backbone=backbone)
 
+    def _tiny_gemma4_assistant(self):
+        # Mirrors the tiny config in `gemma4_assistant_causal_lm_test.py`.
+        backbone = Gemma4Backbone(
+            vocabulary_size=256,
+            num_layers=4,
+            num_query_heads=4,
+            num_key_value_heads=1,
+            hidden_dim=8,
+            intermediate_dim=16,
+            head_dim=4,
+            global_head_dim=8,
+            image_size=16,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+        return Gemma4AssistantCausalLM(
+            preprocessor=None,
+            backbone=backbone,
+            backbone_hidden_size=16,
+            num_centroids=4,
+            centroid_intermediate_top_k=2,
+            use_ordered_embeddings=True,
+        )
+
     def _tiny_qwen(self):
         backbone = QwenBackbone(
             vocabulary_size=10,
@@ -264,10 +297,8 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         self.assertEqual(spec.model_type, "function_gemma")
 
     def test_function_gemma_spec_not_in_isinstance_registry(self):
-        """`FunctionGemmaSpec` must NOT be in `_EXPORT_SPEC_REGISTRY`: since it
-        is a plain `Gemma3CausalLM`, an `isinstance` entry would shadow
-        `Gemma3Spec` for every Gemma3 model. It is reachable only via the
-        explicit override."""
+        """`FunctionGemmaSpec` must NOT be in `_EXPORT_SPEC_REGISTRY`: an
+        `isinstance` entry would shadow `Gemma3Spec` for every Gemma3 model."""
         self.assertNotIn(
             FunctionGemmaSpec, [f for _, _, f in _EXPORT_SPEC_REGISTRY]
         )
@@ -319,6 +350,26 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         spec = resolve_export_spec(self._tiny_phi3())
         self.assertIsInstance(spec, Phi3Spec)
         self.assertEqual(spec.model_type, "generic_model")
+
+    # -- Exportability gate --------------------------------------------------
+
+    def test_gemma4_assistant_check_exportable_raises(self):
+        """`Gemma4AssistantCausalLM` resolves to `Gemma4AssistantSpec`, whose
+        `check_exportable` fails fast with the MTP-draft explanation instead
+        of letting the model fall through to the generic spec and crash in
+        tracing. The base-class gate is a no-op for ordinary models."""
+        model = self._tiny_gemma4_assistant()
+        spec = resolve_export_spec(model)
+        self.assertIs(type(spec), Gemma4AssistantSpec)
+        with self.assertRaisesRegex(
+            ValueError,
+            "does not support `Gemma4AssistantCausalLM`.*"
+            "multi-token-prediction",
+        ):
+            spec.check_exportable(model)
+        self.assertIsNone(
+            LiteRTLMExportSpec().check_exportable(self._tiny_llama())
+        )
 
     # -- Chat-turn stop-token overrides -------------------------------------
     #

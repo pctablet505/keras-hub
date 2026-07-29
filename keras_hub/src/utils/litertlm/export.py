@@ -402,7 +402,6 @@ class ExportPlan:
     cache_length: int
     num_kv_heads: int
     head_dim: int
-    cache_layout: str
     prefill_seq_lens: list
     dtype: object
     has_vision: bool
@@ -1026,18 +1025,9 @@ def export_to_litertlm(
     from keras_hub.src.utils.litertlm.adapter import _cpu_default_device_scope
     from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
 
-    # Fail fast on model families whose cache structure the adapter cannot
-    # build. Every currently-supported family uses a single stacked KV-cache
-    # tensor ("single_stacked"); see `LiteRTLMExportSpec.cache_structure` and
-    # `describe_unsupported_cache_structure` for what a family-specific
-    # mismatch (e.g. Qwen3.5's hybrid cache) looks like and how to explain
-    # it -- this generic check/message applies to any such family, not just
-    # Qwen3.5, so a family-specific explanation belongs on that family's own
-    # spec class, not as a growing set of branches here. Checking this before
-    # any cache-config derivation or tracing turns what used to be a cryptic
-    # `IndexError`
-    # deep inside `LiteRTLMExportSpec.stack_kv_cache` into a clear,
-    # documented error raised before any expensive work happens.
+    # Fail fast on cache structures the adapter cannot build, before any
+    # cache-config derivation or tracing; the spec names the mismatch
+    # (`describe_unsupported_cache_structure`).
     if spec.cache_structure != "single_stacked":
         raise ValueError(
             f"LiteRT-LM export does not support `{type(model).__name__}`: "
@@ -1050,7 +1040,6 @@ def export_to_litertlm(
     cache_length = cache_cfg["cache_length"]
     num_kv_heads = cache_cfg["num_kv_heads"]
     head_dim = cache_cfg["head_dim"]
-    cache_layout = cache_cfg["cache_layout"]
     if cache_cfg["used_preprocessor_fallback"]:
         warnings.warn(
             "`cache_length` was not specified and "
@@ -1169,7 +1158,6 @@ def export_to_litertlm(
         cache_length=cache_length,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        cache_layout=cache_layout,
         prefill_seq_lens=prefill_seq_lens,
         dtype=dtype,
         has_vision=has_vision,

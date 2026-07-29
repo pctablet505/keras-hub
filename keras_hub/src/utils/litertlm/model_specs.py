@@ -972,15 +972,14 @@ class Gemma4Spec(GemmaSpec):
 
     def populate_vision_metadata(self, meta, vision_cfg):
         image_size = vision_cfg["image_size"]
-        patch_size = vision_cfg.get("patch_size")
+        patch_size = vision_cfg["patch_size"]
         pool_size = vision_cfg.get("pool_size")
         subtype = meta.llm_model_type.gemma4
         subtype.start_of_image_token.token_str = _GEMMA4_START_OF_IMAGE_TOKEN
         subtype.end_of_image_token.token_str = _GEMMA4_END_OF_IMAGE_TOKEN
-        if patch_size is not None:
-            subtype.patch_width = patch_size
-            subtype.patch_height = patch_size
-            subtype.max_num_patches = (image_size // patch_size) ** 2
+        subtype.patch_width = patch_size
+        subtype.patch_height = patch_size
+        subtype.max_num_patches = (image_size // patch_size) ** 2
         if pool_size is not None:
             subtype.pooling_kernel_size = pool_size
 
