@@ -79,6 +79,64 @@ def _vision_style_mismatch_message(
     )
 
 
+def _run_vision_encoder_for_style(
+    vision_encoder,
+    vision_input_style,
+    flatten_image_batch,
+    images,
+    pixel_values,
+    pixel_position_ids,
+    reintroduce_n_axis=False,
+):
+    """Validate supplied vision inputs against the declared style and run
+    the vision encoder.
+
+    Shared by ``KerasHubLiteRTAdapter._prepare_image_embeddings`` and
+    ``KerasHubVisionEncoderAdapter.forward``; callers must only pass the
+    two standalone-encoder styles (``"patch_values"`` / ``"raw_images"``).
+    ``reintroduce_n_axis`` is set only by the separate vision-encoder
+    adapter, whose runtime contract may deliver a single 4-D image.
+    """
+    if vision_input_style == "patch_values":
+        if pixel_values is None or pixel_position_ids is None:
+            raise ValueError(
+                _vision_style_mismatch_message(
+                    style="patch_values",
+                    expected="`pixel_values` and `pixel_position_ids`",
+                    got_images=images is not None,
+                    got_pixel_values=pixel_values is not None,
+                    got_pixel_position_ids=pixel_position_ids is not None,
+                )
+            )
+        return vision_encoder(
+            {
+                "pixel_values": pixel_values,
+                "pixel_position_ids": pixel_position_ids,
+            }
+        )
+    if images is None:
+        raise ValueError(
+            _vision_style_mismatch_message(
+                style="raw_images",
+                expected="`images`",
+                got_images=images is not None,
+                got_pixel_values=pixel_values is not None,
+                got_pixel_position_ids=pixel_position_ids is not None,
+            )
+        )
+    if reintroduce_n_axis and images.dim() == 4:
+        # The LiteRT-LM runtime drives the separate vision encoder with a
+        # single image per call and requires the encoder input tensor to
+        # be 3- or 4-D (it rejects 5-D at conversation creation). KerasHub
+        # vision encoders take [B, N, H, W, 3], so accept the runtime's
+        # [B, H, W, 3] and reintroduce the N=1 axis here. `reshape` is
+        # used instead of `unsqueeze`: litert-torch's converter folds an
+        # unsqueeze->reshape chain back to a 5-D conv input, which TFLite
+        # rejects at AllocateTensors time.
+        images = images.reshape(images.shape[0], 1, *images.shape[1:])
+    return _run_vision_encoder(vision_encoder, images, flatten_image_batch)
+
+
 class KerasHubLiteRTAdapter(nn.Module):
     """Adapter that wraps a KerasHub CausalLM for LiteRT-LM export.
 
@@ -286,39 +344,15 @@ class KerasHubLiteRTAdapter(nn.Module):
             )
             return img_embeddings, None
 
-        if self.vision_input_style == "patch_values":
-            if pixel_values is None or pixel_position_ids is None:
-                raise ValueError(
-                    _vision_style_mismatch_message(
-                        style="patch_values",
-                        expected="`pixel_values` and `pixel_position_ids`",
-                        got_images=images is not None,
-                        got_pixel_values=pixel_values is not None,
-                        got_pixel_position_ids=pixel_position_ids is not None,
-                    )
-                )
-            img_embeddings = self.vision_encoder(
-                {
-                    "pixel_values": pixel_values,
-                    "pixel_position_ids": pixel_position_ids,
-                }
-            )
-            return img_embeddings, None
-
-        if self.vision_input_style == "raw_images":
-            if images is None:
-                raise ValueError(
-                    _vision_style_mismatch_message(
-                        style="raw_images",
-                        expected="`images`",
-                        got_images=images is not None,
-                        got_pixel_values=pixel_values is not None,
-                        got_pixel_position_ids=pixel_position_ids is not None,
-                    )
-                )
+        if self.vision_input_style in ("patch_values", "raw_images"):
             return (
-                _run_vision_encoder(
-                    self.vision_encoder, images, self.flatten_image_batch
+                _run_vision_encoder_for_style(
+                    self.vision_encoder,
+                    self.vision_input_style,
+                    self.flatten_image_batch,
+                    images=images,
+                    pixel_values=pixel_values,
+                    pixel_position_ids=pixel_position_ids,
                 ),
                 None,
             )
@@ -466,48 +500,7 @@ class KerasHubVisionEncoderAdapter(nn.Module):
         self.flatten_image_batch = flatten_image_batch
 
     def forward(self, images=None, pixel_values=None, pixel_position_ids=None):
-        if self.vision_input_style == "patch_values":
-            if pixel_values is None or pixel_position_ids is None:
-                raise ValueError(
-                    _vision_style_mismatch_message(
-                        style="patch_values",
-                        expected="`pixel_values` and `pixel_position_ids`",
-                        got_images=images is not None,
-                        got_pixel_values=pixel_values is not None,
-                        got_pixel_position_ids=pixel_position_ids is not None,
-                    )
-                )
-            out = self.vision_encoder(
-                {
-                    "pixel_values": pixel_values,
-                    "pixel_position_ids": pixel_position_ids,
-                }
-            )
-        elif self.vision_input_style == "raw_images":
-            if images is None:
-                raise ValueError(
-                    _vision_style_mismatch_message(
-                        style="raw_images",
-                        expected="`images`",
-                        got_images=images is not None,
-                        got_pixel_values=pixel_values is not None,
-                        got_pixel_position_ids=pixel_position_ids is not None,
-                    )
-                )
-            # The LiteRT-LM runtime drives the separate vision encoder with a
-            # single image per call and requires the encoder input tensor to
-            # be 3- or 4-D (it rejects 5-D at conversation creation). KerasHub
-            # vision encoders take [B, N, H, W, 3], so accept the runtime's
-            # [B, H, W, 3] and reintroduce the N=1 axis here. `reshape` is
-            # used instead of `unsqueeze`: litert-torch's converter folds an
-            # unsqueeze->reshape chain back to a 5-D conv input, which TFLite
-            # rejects at AllocateTensors time.
-            if images.dim() == 4:
-                images = images.reshape(images.shape[0], 1, *images.shape[1:])
-            out = _run_vision_encoder(
-                self.vision_encoder, images, self.flatten_image_batch
-            )
-        else:
+        if self.vision_input_style not in ("patch_values", "raw_images"):
             raise ValueError(
                 "Separate vision-encoder export does not support "
                 f"vision_input_style={self.vision_input_style!r}. Separate "
@@ -515,7 +508,15 @@ class KerasHubVisionEncoderAdapter(nn.Module):
                 "(embedded_pixel_values families run the encoder inside the "
                 "backbone and reject separate export in export_to_litertlm)."
             )
-
+        out = _run_vision_encoder_for_style(
+            self.vision_encoder,
+            self.vision_input_style,
+            self.flatten_image_batch,
+            images=images,
+            pixel_values=pixel_values,
+            pixel_position_ids=pixel_position_ids,
+            reintroduce_n_axis=True,
+        )
         return {"features": out}
 
 
