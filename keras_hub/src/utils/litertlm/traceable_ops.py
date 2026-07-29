@@ -140,9 +140,10 @@ def _traceable_dot_product_attention(
 ):
     """Traceable replacement for Keras torch-backend ``dot_product_attention``.
 
-    ``torch.nn.functional.scaled_dot_product_attention`` lowers to fused ATen
-    ops such as ``aten._scaled_dot_product_efficient_attention`` that
-    ``litert_torch`` cannot translate to TFLite.  This implementation expands
+    ``torch.nn.functional.scaled_dot_product_attention`` lowers to the
+    composite ``aten.scaled_dot_product_attention`` op (torch 2.12 under
+    ``torch.export``), which ``litert_torch`` cannot translate to TFLite.
+    This implementation expands
     attention to a plain ``matmul`` + ``softmax`` + ``matmul`` sequence that
     ``litert_torch`` handles well.
 

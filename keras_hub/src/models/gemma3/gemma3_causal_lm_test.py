@@ -280,9 +280,9 @@ class Gemma3CausalLMTest(TestCase, parameterized.TestCase):
         `Gemma3CausalLM` but, when exported with
         `llm_model_type="function_gemma"`, must map to the `function_gemma`
         `LlmModelType` (not `gemma3`). An explicit override yields the bare
-        oneof without model-specific fields (mirroring litert-torch); the
-        populated function-calling block is exercised separately via
-        tokenizer auto-detection in model_specs_test.py. Uses a tiny dummy
+        oneof without model-specific fields (mirroring litert-torch);
+        tokenizer auto-detection is covered in model_specs_test.py (spec
+        resolution only, not metadata population). Uses a tiny dummy
         text-only model; the real 270M preset is never loaded."""
         if keras.config.backend() != "torch":
             self.skipTest("LiteRT-LM export requires the PyTorch backend.")
@@ -316,8 +316,9 @@ class Gemma3CausalLMTest(TestCase, parameterized.TestCase):
         # model-specific fields populated, mirroring litert-torch, which skips
         # its model-specific metadata builder whenever
         # `litert_lm_model_type_override` is set. The populated
-        # function-calling block is produced only by tokenizer auto-detection
-        # (covered in model_specs_test.py).
+        # function-calling block is produced only by tokenizer auto-detection;
+        # model_specs_test.py covers that detection's spec resolution, not
+        # metadata population.
         fg = meta.llm_model_type.function_gemma
         self.assertEqual(fg.code_fence_start, "")
         self.assertEqual(fg.code_fence_end, "")

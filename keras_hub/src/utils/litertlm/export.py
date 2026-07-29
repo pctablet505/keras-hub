@@ -1539,8 +1539,9 @@ def _build_llm_metadata(
     # `sampler_config`; otherwise the field is omitted so the runtime picks
     # its own sampling policy. Mirrors litert-torch export_hf's conditional
     # `sampler_params` population (core/litert_lm_builder.py ~189-232),
-    # including its GREEDY(top_k==1)/TOP_P/TOP_K type-derivation precedence.
-    # keras-hub ships no default sampler (see model_specs.SamplerConfig).
+    # except that GREEDY(top_k==1) is deliberately emitted as TOP_K k=1
+    # (see below). keras-hub ships no default sampler (see
+    # model_specs.SamplerConfig).
     if sampler_config is not None:
         try:
             from litert_lm_builder.runtime.proto import sampler_params_pb2

@@ -855,14 +855,15 @@ class FunctionGemmaSpec(Gemma3Spec):
 
     Architecturally identical to Gemma3 -- it loads as a plain
     ``Gemma3CausalLM`` (its preset entry uses ``"path": "gemma3"``) -- so it
-    cannot be distinguished by ``isinstance`` in ``resolve_export_spec``, by a
-    config ``model_type`` field (keras-hub's Gemma3 config has none), or by
-    tokenizer special tokens (the Gemma3 SentencePiece tokenizer exposes no
-    function-calling tokens). It is therefore selected explicitly, via
-    ``export_to_litertlm``'s ``llm_model_type="function_gemma"`` override --
-    mirroring litert-torch's own ``litert_lm_model_type_override`` for the same
+    cannot be distinguished by ``isinstance`` in ``resolve_export_spec`` or by
+    a config ``model_type`` field (keras-hub's Gemma3 config has none). It is
+    reached either explicitly -- via ``export_to_litertlm``'s
+    ``llm_model_type="function_gemma"`` override, mirroring litert-torch's own
+    ``litert_lm_model_type_override`` for the same
     architecturally-indistinguishable case
-    (``export_hf/core/litert_lm_builder.py``). Emitting
+    (``export_hf/core/litert_lm_builder.py``) -- or by tokenizer
+    auto-detection (``_is_function_gemma``), which recognizes the
+    function-calling special tokens in its vocabulary. Emitting
     ``model_type = "function_gemma"`` maps it to the
     ``LlmMetadata.llm_model_type`` ``function_gemma`` oneof (a
     ``FunctionGemma`` proto) instead of ``gemma3``, preserving the
@@ -871,8 +872,9 @@ class FunctionGemmaSpec(Gemma3Spec):
 
     Deliberately NOT registered in ``_EXPORT_SPEC_REGISTRY``: since it is a
     plain ``Gemma3CausalLM``, an ``isinstance`` entry would shadow
-    ``Gemma3Spec`` for *every* Gemma3 model. It is reachable only through the
-    explicit override (see ``_MODEL_TYPE_OVERRIDE_SPECS``).
+    ``Gemma3Spec`` for *every* Gemma3 model. Reachability is limited to the
+    explicit override (see ``_MODEL_TYPE_OVERRIDE_SPECS``) and the tokenizer
+    auto-detection above.
     """
 
     model_type = "function_gemma"
@@ -1365,14 +1367,15 @@ _EXPORT_SPEC_REGISTRY = (
 
 
 # Explicit model-type overrides for presets that are architecturally
-# identical to another family and so cannot be told apart by ``isinstance``,
-# config, or tokenizer (see ``FunctionGemmaSpec``). Keyed by the
+# identical to another family and so cannot be told apart by ``isinstance``
+# or config (see ``FunctionGemmaSpec``). Keyed by the
 # ``llm_model_type`` string a caller passes to ``export_to_litertlm``. Mirrors
 # litert-torch's ``litert_lm_model_type_override``
 # (``export_hf/core/litert_lm_builder.py``). NOTE: these spec classes are
-# deliberately NOT in ``_EXPORT_SPEC_REGISTRY`` -- they must only be reached
-# via an explicit override, never via ``isinstance`` (``FunctionGemmaSpec``
-# would otherwise shadow ``Gemma3Spec`` for every Gemma3 model).
+# deliberately NOT in ``_EXPORT_SPEC_REGISTRY`` -- an ``isinstance`` entry
+# cannot tell them apart from the look-alike family (``FunctionGemmaSpec``
+# would shadow ``Gemma3Spec`` for every Gemma3 model). They are reached via
+# this override or tokenizer auto-detection (``_is_function_gemma``).
 _MODEL_TYPE_OVERRIDE_SPECS = {
     "function_gemma": FunctionGemmaSpec,
 }
