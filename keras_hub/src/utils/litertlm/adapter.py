@@ -182,6 +182,7 @@ class KerasHubLiteRTAdapter(nn.Module):
         num_layers,
         cache_length,
         export_spec,
+        has_audio,
         separate_vision_encoder=False,
     ):
         super().__init__()
@@ -217,10 +218,10 @@ class KerasHubLiteRTAdapter(nn.Module):
             None if separate_vision_encoder else vision_encoder
         )
 
-        self.has_audio = (
-            hasattr(keras_model.backbone, "audio_encoder")
-            and keras_model.backbone.audio_encoder is not None
-        )
+        # Caller-resolved fact (export.py's plan: `audio_cfg is not None`) --
+        # a text-only Gemma4/Gemma3n spec declares `audio_input_style` even
+        # with `audio_encoder=None`, so the spec is not a presence signal.
+        self.has_audio = has_audio
         # How this family's audio encoder consumes its input -- see
         # `LiteRTLMExportSpec.audio_input_style` in model_specs.py
         # ("embedded_mel" = encoder runs inside the backbone, "standalone_mel"

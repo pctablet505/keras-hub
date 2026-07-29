@@ -1557,7 +1557,7 @@ class TestLiteRTLmAdapterHelpers(TestCase):
 
         num_layers, cache_length = 2, 20
         adapter = KerasHubLiteRTAdapter(
-            model, num_layers, cache_length, export_spec=spec
+            model, num_layers, cache_length, export_spec=spec, has_audio=False
         )
         tokens = torch.zeros((1, 4), dtype=torch.int32)
         pixel_values = torch.zeros((1, 1, 4, 48), dtype=torch.float32)

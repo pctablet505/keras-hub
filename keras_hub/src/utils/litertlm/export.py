@@ -1226,10 +1226,11 @@ def export_to_litertlm(
             model,
             plan.num_layers,
             plan.cache_length,
+            export_spec=spec,
+            has_audio=plan.has_audio,
             separate_vision_encoder=(
                 plan.separate_vision_encoder and plan.has_vision
             ),
-            export_spec=spec,
         )
         adapter.eval()
 

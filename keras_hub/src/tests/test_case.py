@@ -1460,6 +1460,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             num_layers,
             cache_length,
             export_spec=spec,
+            has_audio=has_audio,
             separate_vision_encoder=False,
         ).eval()
         with torch.no_grad():
