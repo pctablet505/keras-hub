@@ -56,18 +56,6 @@ def _run_vision_encoder(vision_encoder, images, flatten_image_batch):
             batch_size * num_images, height, width, channels
         )
         out = vision_encoder(flat_images)
-    return _extract_vision_features(out)
-
-
-def _extract_vision_features(out):
-    """Extract the feature tensor from a vision encoder output."""
-    if isinstance(out, dict):
-        features = out.get("features")
-        if features is None:
-            features = next(iter(out.values()))
-        return features
-    if isinstance(out, (tuple, list)):
-        return out[0]
     return out
 
 
@@ -320,7 +308,7 @@ class KerasHubLiteRTAdapter(nn.Module):
                     "pixel_position_ids": pixel_position_ids,
                 }
             )
-            return _extract_vision_features(img_embeddings), None
+            return img_embeddings, None
 
         if self.vision_input_style == "raw_images":
             if images is None:
@@ -533,7 +521,7 @@ class KerasHubVisionEncoderAdapter(nn.Module):
                 "backbone and reject separate export in export_to_litertlm)."
             )
 
-        return {"features": _extract_vision_features(out)}
+        return {"features": out}
 
 
 class KerasHubVisionAdapter(nn.Module):
