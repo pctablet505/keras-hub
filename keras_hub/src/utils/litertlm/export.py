@@ -440,7 +440,7 @@ def _build_prefill_inputs(plan):
                     {
                         "mm_embedding": torch.zeros(
                             (
-                                1 * max_images,
+                                max_images,
                                 tokens_per_image,
                                 plan.vision_output_dim,
                             ),
@@ -558,7 +558,6 @@ def _build_vision_encoder_sample_inputs(
 
 def _build_vision_adapter_sample_inputs(
     batch_size,
-    max_images,
     tokens_per_image,
     vision_output_dim,
     dtype,
@@ -570,7 +569,6 @@ def _build_vision_adapter_sample_inputs(
     max_images axis. (Tracing it with batch_size * max_images mismatches the
     single-image encoder output the runtime feeds it at inference time.)
     """
-    del max_images
     return {
         "features": torch.zeros(
             (
@@ -646,7 +644,6 @@ def _trace_and_convert(
             )
             vision_adapter_inputs = _build_vision_adapter_sample_inputs(
                 batch_size=1,
-                max_images=plan.max_images,
                 tokens_per_image=plan.tokens_per_image,
                 vision_output_dim=plan.vision_output_dim,
                 dtype=plan.dtype,
@@ -1302,7 +1299,7 @@ def _build_sample_inputs(
     cache_length,
     num_kv_heads,
     head_dim,
-    dtype=None,
+    dtype,
     cache_layout="standard",
 ):
     """Create concrete sample tensors for one signature.
@@ -1312,8 +1309,6 @@ def _build_sample_inputs(
     - ``"standard"``: ``[batch_size, cache_length, num_kv_heads, head_dim]``
     - ``"gemma3n"``: ``[batch_size, num_kv_heads, cache_length, head_dim]``
     """
-    if dtype is None:
-        dtype = torch.float32
     device = "cpu"
     tokens = torch.zeros(
         (batch_size, seq_len), dtype=torch.int32, device=device
@@ -1348,11 +1343,9 @@ def _build_vision_sample_inputs(
     image_size,
     num_vision_tokens,
     seq_len,
-    dtype=None,
+    dtype,
 ):
     """Create concrete vision sample tensors for a prefill signature."""
-    if dtype is None:
-        dtype = torch.float32
     device = "cpu"
     images = torch.zeros(
         (batch_size, max_images, image_size, image_size, 3),
@@ -1379,15 +1372,13 @@ def _build_gemma4_vision_sample_inputs(
     image_size,
     num_vision_tokens,
     seq_len,
-    dtype=None,
+    dtype,
 ):
     """Create concrete Gemma4 vision sample tensors for a prefill signature.
 
     Gemma4's vision encoder expects pre-processed patches
     (``pixel_values`` + ``pixel_position_ids``) rather than raw RGB images.
     """
-    if dtype is None:
-        dtype = torch.float32
     device = "cpu"
     num_patches = (image_size // patch_size) ** 2
     patch_dim = patch_size * patch_size * 3
@@ -1421,12 +1412,10 @@ def _build_audio_sample_inputs(
     num_frames,
     num_audio_tokens,
     seq_len,
+    dtype,
     audio_input_feat_size=128,
-    dtype=None,
 ):
     """Create concrete audio sample tensors for a prefill signature."""
-    if dtype is None:
-        dtype = torch.float32
     device = "cpu"
     audio_mel = torch.zeros(
         (batch_size, max_clips, num_frames, audio_input_feat_size),
@@ -1586,7 +1575,6 @@ def _build_llm_metadata(
 
         sp = meta.sampler_params
         top_k = sampler_config.top_k
-        top_p = sampler_config.top_p
         if sampler_config.top_k is not None:
             sp.k = sampler_config.top_k
         if sampler_config.top_p is not None:
@@ -1602,8 +1590,6 @@ def _build_llm_metadata(
         # instead, which is functionally equivalent and is implemented.
         if top_k is not None:
             sp.type = SamplerParameters.TOP_K
-        elif top_p is not None:
-            sp.type = SamplerParameters.TOP_P
         else:
             sp.type = SamplerParameters.TOP_P
 
