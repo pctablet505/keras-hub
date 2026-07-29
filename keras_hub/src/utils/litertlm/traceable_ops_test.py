@@ -2,7 +2,7 @@
 
 ``traceable_ops.py`` temporarily replaces a handful of Keras torch-backend
 ops (``one_hot``, ``repeat``, ``slice``, ``take``, ``scatter_update``,
-``dot_product_attention``, ``arange``, ``amax``) with reimplementations that
+``dot_product_attention``, ``amax``) with reimplementations that
 are
 friendlier to ``torch.export`` tracing (see each function's docstring for
 the specific tracing issue it works around). These tests do not exercise
@@ -264,46 +264,6 @@ class TraceableOpsParityTest(TestCase):
             traceable_ops._patched_scatter_update(
                 inputs, indices, updates, reduction="bogus"
             )
-
-    # ------------------------------------------------------------------
-    # arange
-    # ------------------------------------------------------------------
-    def test_arange_matches_original_values(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
-        cases = [
-            (0, 10, 1),
-            (2, 20, 3),
-            (0, 5, None),
-            (0.0, 5.0, 0.5),  # float range: dtype should not be forced
-        ]
-        for start, stop, step in cases:
-            with self.subTest(start=start, stop=stop, step=step):
-                original = torch_backend_numpy.arange(
-                    start, stop=stop, step=step
-                )
-                patched = traceable_ops._patched_arange(
-                    start, stop=stop, step=step
-                )
-                self.assertAllClose(_to_np(original), _to_np(patched))
-
-    def test_arange_forces_int32_for_integer_ranges(self):
-        original = traceable_ops._ORIGINAL_ARANGE(0, stop=10, step=1)
-        patched = traceable_ops._patched_arange(0, stop=10, step=1)
-        self.assertAllClose(_to_np(original), _to_np(patched))
-        self.assertEqual(patched.dtype, torch.int32)
-
-    def test_arange_explicit_dtype_passthrough(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
-        original = torch_backend_numpy.arange(
-            0, stop=10, step=1, dtype=torch.int64
-        )
-        patched = traceable_ops._patched_arange(
-            0, stop=10, step=1, dtype=torch.int64
-        )
-        self.assertAllClose(_to_np(original), _to_np(patched))
-        self.assertEqual(patched.dtype, torch.int64)
 
     # ------------------------------------------------------------------
     # dot_product_attention

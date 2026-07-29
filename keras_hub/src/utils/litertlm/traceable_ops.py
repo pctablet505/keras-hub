@@ -6,7 +6,7 @@ some introduce fused ATen ops, runtime assertions, or unbacked symbolic
 shapes that ``litert_torch`` cannot translate to TFLite. This module holds
 self-contained, drop-in replacements for the handful of ops that need this
 treatment (``one_hot``, ``repeat``, ``slice``, ``take``, ``scatter_update``,
-``dot_product_attention``, ``arange``, ``amax``), plus context managers that
+``dot_product_attention``, ``amax``), plus context managers that
 temporarily monkeypatch Keras's torch backend to use them. This has no
 relationship to ``KerasHubLiteRTAdapter`` beyond being a dependency used
 while tracing it -- it is a standalone "make these ops traceable" shim
@@ -19,7 +19,6 @@ import unittest.mock
 import numpy as np
 import torch
 from keras.src import backend
-from keras.src.backend.common import dtypes as keras_dtypes
 from keras.src.backend.torch import core as torch_core
 from keras.src.backend.torch import nn as torch_backend_nn
 from keras.src.backend.torch import numpy as torch_backend_numpy
@@ -295,38 +294,6 @@ _traceable_one_hot_scope = _make_scope(
 )
 
 
-# Capture the original ``arange`` at module load so the patched version can
-# delegate to it without closing over a local variable.
-_ORIGINAL_ARANGE = torch_backend_numpy.arange
-
-
-def _patched_arange(start, stop=None, step=None, dtype=None):
-    """Patch Keras torch-backend ``arange`` to default integer ranges to int32.
-
-    ``torch.arange`` returns int64 for integer arguments. ``litert_torch``'s
-    i64-to-i32 conversion pass does not always propagate through nested
-    ``func.call`` boundaries, so integer ranges produced inside the model
-    (e.g. position-embedding indices) must be int32 from the start.
-    """
-    if dtype is None:
-        dtypes_to_resolve = [
-            getattr(start, "dtype", type(start)),
-        ]
-        if stop is not None:
-            dtypes_to_resolve.append(getattr(stop, "dtype", type(stop)))
-        if step is not None:
-            dtypes_to_resolve.append(getattr(step, "dtype", type(step)))
-        resolved = keras_dtypes.result_type(*dtypes_to_resolve)
-        if str(resolved).startswith("int"):
-            dtype = torch.int32
-    return _ORIGINAL_ARANGE(start, stop=stop, step=step, dtype=dtype)
-
-
-_traceable_arange_scope = _make_scope(
-    torch_backend_numpy, "arange", _patched_arange
-)
-
-
 def _patched_take(x, indices, axis=None):
     """Patch Keras torch-backend ``take`` to keep embedding indices as int32.
 
@@ -506,17 +473,16 @@ _traceable_amax_scope = _make_scope(torch_backend_numpy, "amax", _patched_amax)
 def traceable_ops_scope():
     """Enter every traceable-op patch scope at once.
 
-    Combines the eight individual patch scopes (slice, dot_product_attention,
-    one_hot, repeat, arange, take, scatter_update, amax) into a single context
+    Combines the seven individual patch scopes (slice, dot_product_attention,
+    one_hot, repeat, take, scatter_update, amax) into a single context
     manager via ``contextlib.ExitStack``, so callers open one scope instead of
-    nesting eight ``with`` statements.
+    nesting seven ``with`` statements.
     """
     with contextlib.ExitStack() as stack:
         stack.enter_context(_traceable_slice_scope())
         stack.enter_context(_traceable_dot_product_attention_scope())
         stack.enter_context(_traceable_one_hot_scope())
         stack.enter_context(_traceable_repeat_scope())
-        stack.enter_context(_traceable_arange_scope())
         stack.enter_context(_traceable_take_scope())
         stack.enter_context(_traceable_scatter_update_scope())
         stack.enter_context(_traceable_amax_scope())
