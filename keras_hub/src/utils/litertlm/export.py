@@ -1040,7 +1040,7 @@ def export_to_litertlm(
     # that a JAX/TF caller without torch gets the friendly backend error.
     from keras_hub.src.utils.litertlm.adapter import KerasHubLiteRTAdapter
     from keras_hub.src.utils.litertlm.adapter import _cpu_default_device_scope
-    from keras_hub.src.utils.litertlm.adapter import _get_vision_encoder
+    from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
 
     # Resolve the model-family export spec once and thread it through the
     # rest of the pipeline (and into the adapter), instead of re-deriving

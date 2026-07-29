@@ -8,6 +8,8 @@ import threading
 import torch
 from torch import nn
 
+from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
+
 # Global lock serializing export-time mutations of PyTorch's default device.
 # This keeps _cpu_default_device_scope thread-safe without changing semantics.
 _DEFAULT_DEVICE_LOCK = threading.Lock()
@@ -28,13 +30,6 @@ def _cpu_default_device_scope():
             yield
         finally:
             torch.set_default_device(original_device)
-
-
-def _get_vision_encoder(backbone):
-    """Return the vision encoder from a backbone, or ``None``."""
-    return getattr(backbone, "vision_encoder", None) or getattr(
-        backbone, "vit_encoder", None
-    )
 
 
 def _run_vision_encoder(vision_encoder, images, flatten_image_batch):

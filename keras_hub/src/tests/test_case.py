@@ -1202,7 +1202,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         # on the optional/heavy litertlm export package.
         from keras_hub.src.utils.litertlm import export as _export
         from keras_hub.src.utils.litertlm.adapter import KerasHubLiteRTAdapter
-        from keras_hub.src.utils.litertlm.adapter import _get_vision_encoder
+        from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
         from keras_hub.src.utils.litertlm.model_specs import resolve_export_spec
 
         # Reconstruct the exact ExportPlan the export pipeline built, so the

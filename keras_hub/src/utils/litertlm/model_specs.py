@@ -37,6 +37,13 @@ def _first_attr(obj, *names, default=None):
     return default
 
 
+def _get_vision_encoder(backbone):
+    """Return the vision encoder from a backbone, or ``None``."""
+    return getattr(backbone, "vision_encoder", None) or getattr(
+        backbone, "vit_encoder", None
+    )
+
+
 # Special token strings used when populating vision/audio metadata. Keeping
 # them as named constants makes it easy to audit which tokens each model
 # family expects and avoids scattering literals through the spec classes.
@@ -385,9 +392,7 @@ class LiteRTLMExportSpec:
         backbone = getattr(model, "backbone", None)
         if backbone is None:
             return None
-        vision_encoder = getattr(backbone, "vision_encoder", None) or getattr(
-            backbone, "vit_encoder", None
-        )
+        vision_encoder = _get_vision_encoder(backbone)
         if vision_encoder is None:
             return None
         preprocessor = getattr(model, "preprocessor", None)
