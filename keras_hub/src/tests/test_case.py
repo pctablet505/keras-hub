@@ -1,9 +1,9 @@
 import gc
+import io
 import json
 import os
 import pathlib
 import re
-import struct
 import tempfile
 
 import keras
@@ -879,14 +879,12 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
             A tuple of ``(data, metadata)`` where ``data`` is the bundle bytes
             and ``metadata`` is the parsed ``LiteRTLMMetaData`` flatbuffer.
         """
-        from litert_lm_builder import litertlm_core as core
+        from litert_lm_builder import litertlm_peek
 
         with open(litertlm_path, "rb") as f:
             data = f.read()
-        header_end = struct.unpack("<Q", data[24:32])[0]
-        metadata_buf = data[32:header_end]
-        metadata = core.schema.LiteRTLMMetaData.GetRootAsLiteRTLMMetaData(
-            metadata_buf, 0
+        metadata = litertlm_peek.read_litertlm_header(
+            litertlm_path, io.StringIO()
         )
         return data, metadata
 
