@@ -87,52 +87,25 @@ _LITERT_TORCH_AVAILABLE = importlib.util.find_spec("litert_torch") is not None
 
 
 @contextlib.contextmanager
-def _preserve_jax_x64_state():
-    """Preserve the JAX ``jax_enable_x64`` flag around ``litert_torch`` usage.
+def _preserve_jax_config_state(name, value=None):
+    """Preserve the JAX config flag ``name`` around ``litert_torch`` usage.
 
-    ``litert_torch`` internally imports JAX and unconditionally enables
-    ``jax_enable_x64``. This breaks dtype-sensitive JAX tests elsewhere in the
-    same process. We save the original setting and restore it after conversion.
+    When ``value`` is given, the flag is pinned to it for the block.
     """
     try:
         import jax
     except ImportError:
         jax = None
-        original_x64 = None
+        original = None
     else:
-        original_x64 = jax.config.jax_enable_x64
+        original = getattr(jax.config, name)
+    if jax is not None and value is not None:
+        jax.config.update(name, value)
     try:
         yield
     finally:
         if jax is not None:
-            jax.config.update("jax_enable_x64", original_x64)
-
-
-@contextlib.contextmanager
-def _preserve_jax_platforms_state():
-    """Preserve the JAX ``jax_platforms`` flag around ``litert_torch`` usage.
-
-    LiteRT-LM's JAX bridge (used internally by ``litert_torch`` during MLIR
-    lowering) defaults to the TPU platform if one is visible, but export must
-    run on CPU so it does not contend with other processes using the TPU. We
-    force ``jax_platforms=cpu`` for the duration of tracing/conversion and
-    restore the caller's original setting afterward, mirroring
-    ``_preserve_jax_x64_state``.
-    """
-    try:
-        import jax
-    except ImportError:
-        jax = None
-        original_platforms = None
-    else:
-        original_platforms = jax.config.jax_platforms
-    if jax is not None:
-        jax.config.update("jax_platforms", "cpu")
-    try:
-        yield
-    finally:
-        if jax is not None:
-            jax.config.update("jax_platforms", original_platforms)
+            jax.config.update(name, original)
 
 
 # ``torch`` is optional. Defining the adapter bases conditionally lets the
@@ -1269,7 +1242,12 @@ def export_to_litertlm(
         prefill_adapter = _PrefillAdapter(adapter).eval()
         decode_adapter = _DecodeAdapter(adapter).eval()
 
-        with _preserve_jax_x64_state(), _preserve_jax_platforms_state():
+        # The JAX bridge defaults to TPU when one is visible; force CPU so
+        # export does not contend with other processes using the TPU.
+        with (
+            _preserve_jax_config_state("jax_enable_x64"),
+            _preserve_jax_config_state("jax_platforms", "cpu"),
+        ):
             import litert_torch
 
             # The import above enables ``jax_enable_x64`` only on its first
