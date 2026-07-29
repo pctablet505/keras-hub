@@ -295,7 +295,11 @@ def _validate_export_args(
                 f"Received: {backend_constraint!r}"
             )
         backend_constraint = backend_constraint.lower()
-        valid_backends = {"cpu", "gpu", "npu", "gpu_artisan"}
+        # Allowed values track upstream `litert_lm_builder.Backend`. Upstream
+        # also accepts comma-separated lists; KerasHub deliberately accepts a
+        # single backend only.
+        litert_lm_builder = _import_litert_lm_builder()
+        valid_backends = {b.value for b in litert_lm_builder.Backend}
         if backend_constraint not in valid_backends:
             raise ValueError(
                 f"Invalid backend_constraint: {backend_constraint!r}. "
