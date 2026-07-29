@@ -144,6 +144,17 @@ class SamplerConfig:
 GREEDY_SAMPLER_CONFIG = SamplerConfig(top_k=1)
 
 
+def _single_stacked_support_description():
+    """The shared error tail naming the one cache structure the adapter
+    supports."""
+    return (
+        "but the LiteRT-LM adapter only supports "
+        '`cache_structure="single_stacked"` (a single stacked '
+        "`[batch, num_layers, 2, cache_length, num_kv_heads, head_dim]` "
+        "KV-cache tensor)."
+    )
+
+
 class LiteRTLMExportSpec:
     """Default LiteRT-LM export behavior for a model family.
 
@@ -378,12 +389,9 @@ class LiteRTLMExportSpec:
         family-specific branch.
         """
         return (
-            f"requires a {self.cache_structure!r} cache structure, but the "
-            "LiteRT-LM adapter only supports "
-            '`cache_structure="single_stacked"` (a single stacked '
-            "`[batch, num_layers, 2, cache_length, num_kv_heads, head_dim]` "
-            "KV-cache tensor). Support for this cache structure is not yet "
-            "implemented."
+            f"requires a {self.cache_structure!r} cache structure, "
+            f"{_single_stacked_support_description()} "
+            "Support for this cache structure is not yet implemented."
         )
 
     def get_vision_config(self, model):
@@ -545,9 +553,11 @@ class LiteRTLMExportSpec:
         """Populate vision-related fields in the ``LlmMetadata`` protobuf.
 
         Default: no-op. Text-only families and families without a dedicated
-        ``LlmModelType`` vision subtype (e.g. generic_model, qwen3,
-        pali_gemma) do not get vision metadata populated, matching today's
-        behavior.
+        ``LlmModelType`` vision subtype (e.g. generic_model, qwen3) do not
+        get vision metadata populated, matching today's behavior. PaliGemma
+        has no vision subtype either, but opts out explicitly on
+        ``PaliGemmaSpec`` because ``GemmaSpec`` carries the gemma3-family
+        population shared by ``Gemma3Spec``/``Gemma3nSpec``.
         """
         del meta, vision_cfg
 
@@ -801,6 +811,14 @@ class GemmaSpec(LiteRTLMExportSpec):
     def get_chat_stop_token_ids(self, tokenizer):
         return _gemma_family_chat_stop_token_ids(tokenizer)
 
+    def populate_vision_metadata(self, meta, vision_cfg):
+        # Shared by the gemma3/gemma3n `LlmModelType` subtypes, which carry
+        # the same image-token fields; `self.model_type` selects the
+        # subtype. FunctionGemma, Gemma4, and PaliGemma override this.
+        _populate_gemma3_family_vision_metadata(
+            meta, self.model_type, vision_cfg
+        )
+
 
 class Gemma3Spec(GemmaSpec):
     model_type = "gemma3"
@@ -808,11 +826,6 @@ class Gemma3Spec(GemmaSpec):
     #: string already used for ``LlmModelType.gemma3.end_of_image_token``
     #: below, rather than a second literal.
     end_of_vision_token = _GEMMA3_END_OF_IMAGE_TOKEN
-
-    def populate_vision_metadata(self, meta, vision_cfg):
-        _populate_gemma3_family_vision_metadata(
-            meta, self.model_type, vision_cfg
-        )
 
 
 class FunctionGemmaSpec(Gemma3Spec):
@@ -845,10 +858,11 @@ class FunctionGemmaSpec(Gemma3Spec):
     def populate_vision_metadata(self, meta, vision_cfg):
         # function_gemma is a text-only preset; the active ``llm_model_type``
         # oneof is ``function_gemma`` (a ``FunctionGemma`` proto with no image
-        # fields), so ``Gemma3Spec``'s gemma3-subtype vision population must
-        # not run here. In practice ``vision_cfg`` is always ``None`` for this
-        # text-only preset, so ``_build_llm_metadata`` never even calls this;
-        # overridden to the base no-op defensively.
+        # fields), so the gemma3-family vision population inherited from
+        # ``GemmaSpec`` must not run here. In practice ``vision_cfg`` is
+        # always ``None`` for this text-only preset, so
+        # ``_build_llm_metadata`` never even calls this; overridden to the
+        # base no-op defensively.
         del meta, vision_cfg
 
     def populate_function_gemma_metadata(self, meta):
@@ -889,11 +903,6 @@ class Gemma3nSpec(GemmaSpec):
     #: pack as a separate bundle section. See
     #: ``LiteRTLMExportSpec.supports_separate_vision``.
     supports_separate_vision = False
-
-    def populate_vision_metadata(self, meta, vision_cfg):
-        _populate_gemma3_family_vision_metadata(
-            meta, self.model_type, vision_cfg
-        )
 
     def populate_audio_metadata(self, meta, audio_cfg):
         del audio_cfg
@@ -1020,6 +1029,12 @@ class PaliGemmaSpec(GemmaSpec):
     # metadata-vacuum documented above (no dedicated `LlmModelType` subtype
     # either).
 
+    def populate_vision_metadata(self, meta, vision_cfg):
+        # PaliGemma has no dedicated `LlmModelType` vision subtype (see the
+        # class docstring), so the gemma3-family population inherited from
+        # `GemmaSpec` must not run here; keep the base no-op.
+        del meta, vision_cfg
+
 
 class Llama3Spec(LiteRTLMExportSpec):
     """Llama3's chat template ends a turn with ``<|eot_id|>``.
@@ -1087,6 +1102,16 @@ class Phi3Spec(LiteRTLMExportSpec):
 #   chat-turn-boundary token in their tokenizer definitions.
 
 
+def _qwen_family_chat_stop_token_ids(tokenizer):
+    """Return ``[<|im_end|> id]`` if present in *tokenizer*'s vocab.
+
+    ``<|im_end|>`` is the ChatML chat-turn-stop token shared by the Qwen
+    families (Qwen3 and pre-Qwen3 Qwen/Qwen-MoE alike).
+    """
+    token_id = _lookup_token_id(tokenizer, "<|im_end|>")
+    return [token_id] if token_id is not None else []
+
+
 class Qwen3FamilySpec(LiteRTLMExportSpec):
     """Qwen3, Qwen3-MoE, and Qwen3.5 all map to the "qwen3" oneof."""
 
@@ -1100,8 +1125,7 @@ class Qwen3FamilySpec(LiteRTLMExportSpec):
         # to already be the right token; `_build_llm_metadata`
         # de-duplicates against `end_token_id` so this does not add a
         # redundant entry to the exported metadata.
-        token_id = _lookup_token_id(tokenizer, "<|im_end|>")
-        return [token_id] if token_id is not None else []
+        return _qwen_family_chat_stop_token_ids(tokenizer)
 
 
 class Qwen3_5Spec(Qwen3FamilySpec):
@@ -1121,11 +1145,8 @@ class Qwen3_5Spec(Qwen3FamilySpec):
             "structure (`call_with_cache` expects a `(kv_cache, conv_cache, "
             "recurrent_cache)` tuple, since linear-attention layers need a "
             "convolutional/recurrent state that a stacked KV tensor cannot "
-            "represent), but the LiteRT-LM adapter only supports "
-            '`cache_structure="single_stacked"` (a single stacked '
-            "`[batch, num_layers, 2, cache_length, num_kv_heads, head_dim]` "
-            "KV-cache tensor). Support for hybrid cache structures is not "
-            "yet implemented."
+            f"represent), {_single_stacked_support_description()} "
+            "Support for hybrid cache structures is not yet implemented."
         )
 
 
@@ -1141,8 +1162,7 @@ class Qwen2p5FamilySpec(LiteRTLMExportSpec):
         # include `<|im_end|>` in their vocabulary as an ordinary token. Add
         # it as a chat-stop token when present; do nothing when it is not
         # (base/non-chat Qwen 2.5 vocabularies).
-        token_id = _lookup_token_id(tokenizer, "<|im_end|>")
-        return [token_id] if token_id is not None else []
+        return _qwen_family_chat_stop_token_ids(tokenizer)
 
 
 def _populate_gemma3_family_vision_metadata(meta, model_type, vision_cfg):
