@@ -34,6 +34,11 @@ _GEMMA4_END_OF_IMAGE_TOKEN = "<image|>"
 _AUDIO_START_TOKEN = "<|audio>"
 _AUDIO_END_TOKEN = "<audio|>"
 
+#: Trace-time frame count for the audio sample inputs; no KerasHub
+#: preprocessor exposes a frames attribute, so this fixes the exported
+#: ``audio_mel`` signature shape.
+_DEFAULT_AUDIO_NUM_FRAMES = 100
+
 # Function-calling ("function_gemma") metadata strings, supplied as
 # literals because keras-hub's Gemma3 tokenizer has no HuggingFace
 # ``special_tokens_map`` carrying them (proto fields shared with Gemma4).
@@ -80,27 +85,28 @@ class SamplerConfig:
             )
         if self.top_k is not None and self.top_k < 1:
             raise ValueError(
-                f"SamplerConfig.top_k must be >= 1, got {self.top_k}."
+                "SamplerConfig.top_k must be >= 1. "
+                f"Received: top_k={self.top_k}."
             )
         if self.top_p is not None and not (0.0 < self.top_p <= 1.0):
             raise ValueError(
-                f"SamplerConfig.top_p must be in (0.0, 1.0], got {self.top_p}."
+                "SamplerConfig.top_p must be in (0.0, 1.0]. "
+                f"Received: top_p={self.top_p}."
             )
         if self.temperature is not None and self.temperature < 0.0:
             raise ValueError(
-                "SamplerConfig.temperature must be >= 0.0, got "
-                f"{self.temperature}."
+                "SamplerConfig.temperature must be >= 0.0. "
+                f"Received: temperature={self.temperature}."
             )
 
 
-#: Deterministic greedy sampling (``top_k == 1``), used by the on-device
-#: host-vs-device verification path. The only named preset keras-hub ships.
+#: Deterministic greedy sampling (``top_k == 1``). The only named sampler
+#: preset keras-hub ships; exercised by the metadata roundtrip test.
 GREEDY_SAMPLER_CONFIG = SamplerConfig(top_k=1)
 
 
 def _single_stacked_support_description():
-    """The shared error tail naming the one cache structure the adapter
-    supports."""
+    """The shared error tail naming the supported cache structure."""
     return (
         "but the LiteRT-LM adapter only supports "
         '`cache_structure="single_stacked"` (a single stacked '
@@ -156,15 +162,13 @@ class LiteRTLMExportSpec:
     #: (Gemma3n): there is no separable encoder to export.
     supports_separate_vision = True
 
-    # -- Cache / vision / audio config -----------------------------------
-
     def get_cache_config(self, model, cache_length=None):
         """Extract KV-cache dimensions from the model.
 
         Args:
-            model: The KerasHub ``CausalLM`` being exported.
-            cache_length: Optional explicit cache length. When ``None``, the
-                cache length is inferred from `backbone.max_sequence_length`
+            model: ``CausalLM``. The KerasHub model being exported.
+            cache_length: int or None. Explicit cache length; when ``None``,
+                the cache length is inferred from `backbone.max_sequence_length`
                 if the backbone defines it, else from
                 `preprocessor.sequence_length` -- the caller is responsible
                 for warning about this fallback, since the warning needs
@@ -259,6 +263,7 @@ class LiteRTLMExportSpec:
         ``Gemma4AssistantSpec``) override this to fail fast with a
         family-specific explanation.
         """
+        del model
 
     def describe_unsupported_cache_structure(self):
         """Explain why ``cache_structure`` isn't ``"single_stacked"``.
@@ -333,8 +338,13 @@ class LiteRTLMExportSpec:
                 "`preprocessor.num_vision_tokens_per_image`."
             )
         num_vision_tokens = num_vision_tokens_per_image * max_images
-        # Fall back to 16 when the encoder does not declare a patch size.
-        patch_size = getattr(vision_encoder, "patch_size", None) or 16
+        patch_size = getattr(vision_encoder, "patch_size", None)
+        if patch_size is None:
+            raise ValueError(
+                "Could not determine `patch_size`: the vision encoder "
+                f"(`{type(vision_encoder).__name__}`) does not declare a "
+                "`patch_size` attribute."
+            )
         pool_size = getattr(vision_encoder, "pool_size", None)
         return {
             "max_images_per_prompt": max_images,
@@ -358,15 +368,30 @@ class LiteRTLMExportSpec:
         max_clips = getattr(preprocessor, "max_audio_clips_per_prompt", None)
         if max_clips is None:
             # Gemma3n names this attribute ``max_audios_per_prompt``.
-            max_clips = getattr(preprocessor, "max_audios_per_prompt", 1)
-        num_frames = getattr(preprocessor, "max_audio_frames", 100)
+            max_clips = getattr(preprocessor, "max_audios_per_prompt", None)
+        if max_clips is None:
+            raise ValueError(
+                "Could not determine `max_clips_per_prompt`. Searched "
+                "`preprocessor.max_audio_clips_per_prompt` and "
+                "`preprocessor.max_audios_per_prompt`."
+            )
+        # Trace-time frame count for the audio sample inputs: no KerasHub
+        # preprocessor exposes a frames attribute, so this fixes the
+        # exported `audio_mel` signature shape.
+        num_frames = _DEFAULT_AUDIO_NUM_FRAMES
         num_audio_tokens_per_clip = getattr(
             backbone, "num_audio_tokens_per_clip", None
         )
         if num_audio_tokens_per_clip is None and preprocessor is not None:
             # Gemma3n names this attribute ``num_audio_tokens_per_audio``.
             num_audio_tokens_per_clip = getattr(
-                preprocessor, "num_audio_tokens_per_audio", 0
+                preprocessor, "num_audio_tokens_per_audio", None
+            )
+        if num_audio_tokens_per_clip is None:
+            raise ValueError(
+                "Could not determine `num_audio_tokens_per_clip`. Searched "
+                "`backbone.num_audio_tokens_per_clip` and "
+                "`preprocessor.num_audio_tokens_per_audio`."
             )
         num_audio_tokens = num_audio_tokens_per_clip * max_clips
         audio_input_feat_size = getattr(
@@ -376,10 +401,14 @@ class LiteRTLMExportSpec:
             audio_converter = getattr(preprocessor, "audio_converter", None)
             if audio_converter is not None:
                 audio_input_feat_size = getattr(
-                    audio_converter, "feature_size", 128
+                    audio_converter, "feature_size", None
                 )
         if audio_input_feat_size is None:
-            audio_input_feat_size = 128
+            raise ValueError(
+                "Could not determine `audio_input_feat_size`. Searched "
+                "`preprocessor.audio_input_feat_size` and "
+                "`preprocessor.audio_converter.feature_size`."
+            )
         return {
             "max_clips_per_prompt": max_clips,
             "num_frames": num_frames,
@@ -417,8 +446,6 @@ class LiteRTLMExportSpec:
             "`flatten_image_batch = True` on the spec."
         )
 
-    # -- LlmMetadata population -------------------------------------------
-
     def populate_vision_metadata(self, meta, vision_cfg):
         """Populate vision-related fields in the ``LlmMetadata`` protobuf.
 
@@ -444,8 +471,6 @@ class LiteRTLMExportSpec:
         """
         del meta
 
-    # -- Adapter-level multimodal handling ---------------------------------
-
     def reshape_separate_vision_embeddings(
         self, img_embeddings, tokens, preprocessor
     ):
@@ -469,7 +494,6 @@ class LiteRTLMExportSpec:
         del tokens, cache_length
         return {}
 
-    # -- KV-cache stack/unstack ---------------------------------------------
     # Converting between the flat signature tensors and the family's
     # ``call_with_cache`` cache shape is per-family behavior, so it lives on
     # the spec (a hybrid-cache family overrides these, not the adapter).
@@ -509,8 +533,6 @@ class LiteRTLMExportSpec:
             outputs[f"kv_cache_v_{i}"] = cache[:, i, 1, ...]
         return outputs
 
-    # -- Metadata: chat-turn stop tokens -----------------------------------
-
     def get_chat_stop_token_ids(self, tokenizer):
         """Return extra chat-turn-boundary stop token ids for this family.
 
@@ -523,8 +545,6 @@ class LiteRTLMExportSpec:
         """
         del tokenizer
         return []
-
-    # -- Metadata: end-of-vision (EOI) section -----------------------------
 
     def get_end_of_vision_token_ids(self, tokenizer):
         """Return this family's end-of-image token id(s), or ``None``.
@@ -631,8 +651,8 @@ class FunctionGemmaSpec(Gemma3Spec):
         Mirrors litert-torch's Gemma4 metadata builder
         (``export_hf/model_ext/gemma4/metadata_builder.py``), whose
         function-calling field block ``FunctionGemma`` shares (proto fields
-        5-14). ``constraint_mode`` is left at its proto default, as upstream
-        leaves it.
+        5-14). ``constraint_mode`` is left at its proto default, as
+        litert-torch leaves it.
         """
         subtype = meta.llm_model_type.function_gemma
         subtype.code_fence_start = _FUNCTION_GEMMA_CODE_FENCE_START
@@ -665,6 +685,9 @@ class Gemma3nSpec(GemmaSpec):
 
     def populate_audio_metadata(self, meta, audio_cfg):
         del audio_cfg
+        # Deliberately Gemma4's audio token strings: that is what the
+        # verified golden gemma3n bundles contain. Do NOT "fix" these to
+        # Gemma3n's own `<start_of_audio>`/`<end_of_audio>` tokenizer tokens.
         subtype = meta.llm_model_type.gemma3n
         subtype.start_of_audio_token.token_str = _AUDIO_START_TOKEN
         subtype.end_of_audio_token.token_str = _AUDIO_END_TOKEN
@@ -812,7 +835,6 @@ class Phi3Spec(LiteRTLMExportSpec):
         return [token_id] if token_id is not None else []
 
 
-# -- Text families with no distinct chat-turn stop token -------------------
 # These keep the `LiteRTLMExportSpec` default (EOS-only): Mistral/Mixtral
 # end turns with the primary EOS `</s>`; base Llama, GPT2, Bloom, GPT-NeoX
 # and OPT are base LMs with no second chat-turn token in their tokenizers.
@@ -840,11 +862,12 @@ class Qwen3FamilySpec(LiteRTLMExportSpec):
 
 
 class Qwen3_5Spec(Qwen3FamilySpec):
-    """Qwen3.5 maps to the "qwen3" oneof like the rest of the family, but its
-    hybrid full-attention/linear-attention decoder layers need a dual cache
-    (`Qwen3_5CausalLM.call_with_cache` expects a `(kv_cache, conv_cache,
-    recurrent_cache)` tuple) that the LiteRT-LM adapter's single
-    stacked-KV-tensor cache format cannot represent yet.
+    """Qwen3.5 spec: maps to "qwen3" but its hybrid cache is unsupported.
+
+    Qwen3.5's hybrid full-attention/linear-attention decoder layers need a
+    dual cache (``Qwen3_5CausalLM.call_with_cache`` expects a ``(kv_cache,
+    conv_cache, recurrent_cache)`` tuple) that the LiteRT-LM adapter's
+    single stacked-KV-tensor cache format cannot represent yet.
     """
 
     cache_structure = "hybrid"
@@ -967,14 +990,10 @@ _EXPORT_SPEC_REGISTRY = (
     ),
 )
 
-# -- Deferred / not-yet-decided chat-stop-token cases -----------------------
-# - SmolLM3: HF SmolLM3 ends turns with `<|im_end|>`, but keras-hub's
-#   `SmolLM3Tokenizer` does not register that token, so an override would
-#   never fire. Left EOS-only until the tokenizer registers it.
-# - GPT-OSS: picking a harmony-format stop token (`<|return|>`/`<|end|>`/
-#   `<|call|>`) needs role/channel semantics keras-hub does not encode, and
-#   picking wrong ships an incorrect stop token. Left EOS-only.
-# - Falcon: export-blocked (see `falcon_causal_lm_test.py`'s xfail).
+# Deferred chat-stop-token cases, all left EOS-only: SmolLM3 (keras-hub's
+# tokenizer does not register `<|im_end|>`), GPT-OSS (harmony stop-token
+# semantics not encoded in keras-hub), Falcon (`falcon_causal_lm_test.py`
+# xfail).
 
 
 # Explicit model-type overrides for presets architecturally identical to
@@ -1015,8 +1034,7 @@ def resolve_export_spec(model, llm_model_type=None):
     ``isinstance`` checks against ``_EXPORT_SPEC_REGISTRY`` (in registration
     order, first match wins, to avoid mis-identifying user-defined
     subclasses). Unrecognized models get the default ``LiteRTLMExportSpec()``
-    (``model_type="generic_model"``, ``cache_layout="standard"``), matching
-    today's fallback behavior.
+    (``model_type="generic_model"``, ``cache_layout="standard"``).
     """
     if llm_model_type is not None:
         try:
@@ -1034,11 +1052,11 @@ def resolve_export_spec(model, llm_model_type=None):
     if _is_function_gemma(model):
         return FunctionGemmaSpec()
     for module_path, class_name, spec_factory in _EXPORT_SPEC_REGISTRY:
-        try:
-            module = __import__(module_path, fromlist=[class_name])
-            cls = getattr(module, class_name)
-        except ImportError:
-            continue
+        # Modules are imported lazily so importing this module stays cheap;
+        # all entries are first-party and must import cleanly -- an
+        # ImportError here is a real bug and must surface, not be skipped.
+        module = __import__(module_path, fromlist=[class_name])
+        cls = getattr(module, class_name)
         if isinstance(model, cls):
             return spec_factory()
 

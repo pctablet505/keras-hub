@@ -3,7 +3,7 @@
 Every ``BytePairTokenizer`` already wraps a live ``tokenizers.Tokenizer``
 object (``self._tokenizer``, built in ``_set_vocabulary_and_merges_tokenizers``
 from KerasHub's own vocab/merges and used for every ``encode_batch``/
-``decode_batch``). This module calls ``.to_str()`` on that same object — it
+``decode_batch``). This module calls ``.to_str()`` on that same object -- it
 is *not* a format conversion and re-derives no token ids, so token identity
 is byte-exact by construction. HF ``tokenizer.json`` is the target because
 the LiteRT-LM runtime accepts only two on-device tokenizer formats

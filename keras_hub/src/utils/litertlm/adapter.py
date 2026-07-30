@@ -1,5 +1,4 @@
-"""PyTorch adapter modules for exporting KerasHub CausalLM models to
-LiteRT-LM."""
+"""PyTorch adapters for exporting KerasHub CausalLM models to LiteRT-LM."""
 
 import contextlib
 import inspect
@@ -51,27 +50,27 @@ def _run_vision_encoder(vision_encoder, images, flatten_image_batch):
 
 
 def _vision_style_mismatch_message(
-    style, expected, got_images, got_pixel_values, got_pixel_position_ids
+    style,
+    expected,
+    supplied_images,
+    supplied_pixel_values,
+    supplied_pixel_position_ids,
 ):
-    """Build the error for a vision_input_style / supplied-args mismatch."""
+    """Build the error for a vision_input_style/supplied-args mismatch."""
     supplied = [
         name
         for name, present in (
-            ("images", got_images),
-            ("pixel_values", got_pixel_values),
-            ("pixel_position_ids", got_pixel_position_ids),
+            ("images", supplied_images),
+            ("pixel_values", supplied_pixel_values),
+            ("pixel_position_ids", supplied_pixel_position_ids),
         )
         if present
     ]
-    supplied_str = ", ".join(supplied) if supplied else "none of them"
+    supplied_str = ", ".join(supplied) if supplied else "none"
     return (
-        f"vision_input_style={style!r} requires {expected} to be supplied "
-        f"to the prefill call, but the supplied vision inputs were: "
-        f"{supplied_str}. This means the declared spec style and the "
-        f"actual arguments disagree -- e.g. passing `pixel_values` to a "
-        f"family declared 'raw_images', or `images` to a 'patch_values' "
-        f"family. Check the model's LiteRTLMExportSpec.vision_input_style "
-        f"and the exported prefill signature's inputs."
+        f"vision_input_style={style!r} requires {expected} as input. "
+        f"Received vision inputs: {supplied_str}. Check the model's "
+        "`LiteRTLMExportSpec.vision_input_style`."
     )
 
 
@@ -84,8 +83,7 @@ def _run_vision_encoder_for_style(
     pixel_position_ids,
     reintroduce_n_axis=False,
 ):
-    """Validate supplied vision inputs against the declared style and run
-    the vision encoder.
+    """Validate vision inputs against the declared style and run the encoder.
 
     Shared by ``KerasHubLiteRTAdapter._prepare_image_embeddings`` and
     ``KerasHubVisionEncoderAdapter.forward``; callers must only pass the
@@ -99,9 +97,9 @@ def _run_vision_encoder_for_style(
                 _vision_style_mismatch_message(
                     style="patch_values",
                     expected="`pixel_values` and `pixel_position_ids`",
-                    got_images=images is not None,
-                    got_pixel_values=pixel_values is not None,
-                    got_pixel_position_ids=pixel_position_ids is not None,
+                    supplied_images=images is not None,
+                    supplied_pixel_values=pixel_values is not None,
+                    supplied_pixel_position_ids=pixel_position_ids is not None,
                 )
             )
         return vision_encoder(
@@ -115,9 +113,9 @@ def _run_vision_encoder_for_style(
             _vision_style_mismatch_message(
                 style="raw_images",
                 expected="`images`",
-                got_images=images is not None,
-                got_pixel_values=pixel_values is not None,
-                got_pixel_position_ids=pixel_position_ids is not None,
+                supplied_images=images is not None,
+                supplied_pixel_values=pixel_values is not None,
+                supplied_pixel_position_ids=pixel_position_ids is not None,
             )
         )
     if reintroduce_n_axis and images.dim() == 4:
@@ -142,6 +140,9 @@ class KerasHubLiteRTAdapter(nn.Module):
 
     Multimodal prefill inputs (when model has a vision/audio encoder):
         images:       float32 [batch, num_images, H, W, 3]
+        pixel_values: float32 [batch, num_images, num_patches, patch_dim]
+        pixel_position_ids: int32 [batch, num_images, num_patches]
+        mm_embedding: float32 [batch, num_vision_tokens, hidden_dim]
         vision_indices: int32 [batch, num_vision_tokens]
         vision_mask:  int32 [batch, seq_len] or bool
         audio_mel:    float32 [batch, num_clips, num_frames, 128]
@@ -152,7 +153,7 @@ class KerasHubLiteRTAdapter(nn.Module):
 
     Outputs (prefill):
         kv_cache_k_0, kv_cache_v_0, ...: updated per-layer KV caches
-        (no logits – LiteRT-LM extracts last-token logits via decode)
+        (no logits -- LiteRT-LM extracts last-token logits via decode)
 
     Outputs (decode):
         logits:       float [batch, seq_len, vocab_size]
@@ -231,14 +232,14 @@ class KerasHubLiteRTAdapter(nn.Module):
         mm_embedding=None,
         **kv_cache,
     ):
-        """Prefill step – processes the full prompt at the given cache position.
+        """Prefill step: process the full prompt at the given cache position.
 
         LiteRT-LM requires prefill to return **only** KV cache tensors
-        (no logits).  The runtime extracts the last-token logits internally
+        (no logits). The runtime extracts the last-token logits internally
         via a dedicated decode step.
 
         ``input_pos`` is a 1-D int32 tensor (e.g. ``[0, 1, 2, ...]`` for the
-        first turn, or ``[N, N+1, ...]`` for subsequent turns).  The first
+        first turn, or ``[N, N+1, ...]`` for subsequent turns). The first
         element is used as the cache-update index so that prefill appends to
         the existing cache instead of overwriting from position 0.
         """
@@ -344,8 +345,8 @@ class KerasHubLiteRTAdapter(nn.Module):
         """Return audio embeddings and optional input feature tensors.
 
         Audio is always baked into the PREFILL_DECODE trace; there is no
-        separate-audio-encoder export path because upstream publishes no
-        reference contract for audio bundle sections (unlike
+        separate-audio-encoder export path because the LiteRT-LM runtime
+        publishes no reference contract for audio bundle sections (unlike
         ``VISION_ENCODER``/``VISION_ADAPTER``).
         """
         if not self.has_audio or audio_mel is None:
@@ -363,9 +364,9 @@ class KerasHubLiteRTAdapter(nn.Module):
         return audio_embeddings, None, None
 
     def forward_decode(self, tokens, input_pos, **kv_cache):
-        """Decode step – processes a single token at *input_pos*.
+        """Decode step: process a single token at ``input_pos``.
 
-        ``input_pos`` is a scalar int32 tensor (e.g. ``[3]``).  It is passed
+        ``input_pos`` is a scalar int32 tensor (e.g. ``[3]``). It is passed
         directly as the cache-update index so that the value remains a tensor
         inside the exported graph and is not baked in as a Python constant.
         """
@@ -449,7 +450,7 @@ class KerasHubVisionEncoderAdapter(nn.Module):
     preprocessed patches. The call is dispatched on the family's declared
     ``spec.vision_input_style`` (passed in at construction), not inferred
     from which argument the caller supplied. The output is always returned
-    as a dict named ``features`` to match upstream tensor names.
+    as a dict named ``features`` to match litert-torch's tensor names.
     """
 
     def __init__(self, keras_model, vision_input_style, flatten_image_batch):
@@ -495,12 +496,13 @@ class KerasHubVisionAdapter(nn.Module):
 class KerasHubEndOfImageAdapter(nn.Module):
     """End-of-image (EOI) embedding, exported as a separate LiteRT-LM model.
 
-    Mirrors litert-torch's ``END_OF_VISION`` bundle section: upstream packs
-    an ``eoi.tflite`` whose only output is the end-of-image token embedding.
-    KerasHub's vision adapter is a plain rename and does not fold an EOI
-    embedding into ``mm_embedding`` the way upstream's gemma3/gemma3n
-    adapters do, so the embedding ships as its own section for
-    separate-vision exports of families declaring an ``end_of_vision_token``.
+    Mirrors litert-torch's ``END_OF_VISION`` bundle section: litert-torch
+    packs an ``eoi.tflite`` whose only output is the end-of-image token
+    embedding. KerasHub's vision adapter is a plain rename and does not fold
+    an EOI embedding into ``mm_embedding`` the way litert-torch's
+    gemma3/gemma3n adapters do, so the embedding ships as its own section
+    for separate-vision exports of families declaring an
+    ``end_of_vision_token``.
 
     Takes no runtime inputs -- the end-of-image token id(s) are fixed at
     export time, so the embedding lookup constant-folds during tracing.
@@ -510,7 +512,7 @@ class KerasHubEndOfImageAdapter(nn.Module):
         super().__init__()
         self.token_embedding = keras_model.backbone.token_embedding
         # A plain Python list (not a registered buffer): the ids are
-        # export-time constants, matching upstream's input-less form.
+        # export-time constants, matching litert-torch's input-less form.
         self._eoi_token_ids = list(eoi_token_ids)
 
     def forward(self):

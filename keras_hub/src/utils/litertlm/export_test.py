@@ -15,6 +15,17 @@ from keras_hub.src.models.gemma.gemma_causal_lm_preprocessor import (
     GemmaCausalLMPreprocessor,
 )
 from keras_hub.src.models.gemma.gemma_tokenizer import GemmaTokenizer
+from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
+from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
+from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
+    Gemma3CausalLMPreprocessor,
+)
+from keras_hub.src.models.gemma3.gemma3_image_converter import (
+    Gemma3ImageConverter,
+)
+from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
+    Gemma3VisionEncoder,
+)
 from keras_hub.src.models.gpt2.gpt2_backbone import GPT2Backbone
 from keras_hub.src.models.gpt2.gpt2_causal_lm import GPT2CausalLM
 from keras_hub.src.models.gpt2.gpt2_causal_lm_preprocessor import (
@@ -33,12 +44,19 @@ from keras_hub.src.models.qwen3.qwen3_causal_lm_preprocessor import (
     Qwen3CausalLMPreprocessor,
 )
 from keras_hub.src.models.qwen3.qwen3_tokenizer import Qwen3Tokenizer
+from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import MockGemma3Tokenizer
 from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.litertlm import export
+from keras_hub.src.utils.litertlm.adapter import KerasHubLiteRTAdapter
+from keras_hub.src.utils.litertlm.adapter import KerasHubVisionEncoderAdapter
 from keras_hub.src.utils.litertlm.adapter import _cpu_default_device_scope
 from keras_hub.src.utils.litertlm.hf_tokenizer_converter import (
     materialize_hf_tokenizer_json,
 )
+from keras_hub.src.utils.litertlm.model_specs import GREEDY_SAMPLER_CONFIG
+from keras_hub.src.utils.litertlm.model_specs import Gemma3Spec
+from keras_hub.src.utils.litertlm.model_specs import SamplerConfig
+from keras_hub.src.utils.litertlm.model_specs import resolve_export_spec
 
 _LITERT_TORCH_AVAILABLE = importlib.util.find_spec("litert_torch") is not None
 _LITERT_LM_BUILDER_AVAILABLE = (
@@ -440,21 +458,6 @@ class TestLiteRTLmExport(TestCase):
         max_images=2, random_weights=True`. The mock tokenizer gets a
         SentencePiece asset because the export raises without one.
         """
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_causal_lm_preprocessor import (
-            Gemma3CausalLMPreprocessor,
-        )
-        from keras_hub.src.models.gemma3.gemma3_image_converter import (
-            Gemma3ImageConverter,
-        )
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.tests.mocks.mock_gemma3_tokenizer import (
-            MockGemma3Tokenizer,
-        )
-
         tokenizer = MockGemma3Tokenizer()
         self._attach_sentencepiece_tokenizer_asset(
             tokenizer,
@@ -513,8 +516,8 @@ class TestLiteRTLmExport(TestCase):
         enforced for all vision-capable families pending a per-family
         assessment -- not as a Gemma3-specific attention-mask limitation.
 
-        This is the accuracy half of V-7: the restriction itself is unchanged
-        (see `test_export_multimodal_bucketing_raises`); only its stated
+        The restriction itself is unchanged (see
+        `test_export_multimodal_bucketing_raises`); only its stated
         justification was corrected. Guards against the message regressing to
         the old "This is a limitation of the Gemma3 attention mask
         computation" wording that over-attributed a family-wide default to
@@ -575,10 +578,6 @@ class TestLiteRTLmExport(TestCase):
         """
         from litert_lm_builder.runtime.proto import sampler_params_pb2
 
-        from keras_hub.src.utils.litertlm.model_specs import (
-            GREEDY_SAMPLER_CONFIG,
-        )
-
         path = os.path.join(self.get_temp_dir(), "greedy_sampler.litertlm")
         self.model.export(
             path,
@@ -596,8 +595,6 @@ class TestLiteRTLmExport(TestCase):
 
     def test_sampler_config_validation_and_export_rejects_bad_type(self):
         """Invalid `SamplerConfig` values and non-config types raise."""
-        from keras_hub.src.utils.litertlm.model_specs import SamplerConfig
-
         # Dataclass-level validation: top_k < 1 is invalid.
         with self.assertRaises(ValueError):
             SamplerConfig(top_k=0)
@@ -661,8 +658,8 @@ class TestLiteRTLmExport(TestCase):
         """Host-side multimodal (baked-in vision) numeric parity.
 
         Gemma3 is chosen because its baked-in vision parity is already
-        proven elsewhere; the tolerance is
-        1e-4 (Gemma3's proven value), not relaxed.
+        proven by `gemma3_causal_lm_test.py`'s multimodal export test; the
+        tolerance is 1e-4 (Gemma3's proven value), not relaxed.
         """
         # Random (not default) weights so the parity check is meaningful --
         # otherwise both backends would compute on identical default values.
@@ -956,8 +953,6 @@ class TestLiteRTLmExport(TestCase):
         # Keras reference's `token_embedding` lookup for Gemma3's
         # end-of-image token id, the same value
         # `KerasHubEndOfImageAdapter.forward` computes at trace time.
-        from keras_hub.src.utils.litertlm.model_specs import Gemma3Spec
-
         eoi_token_ids = Gemma3Spec().get_end_of_vision_token_ids(tokenizer)
         self.assertIsNotNone(eoi_token_ids)
         with torch.no_grad():
@@ -1082,6 +1077,10 @@ class TestLiteRTLmExport(TestCase):
         self._verify_litertlm_generation(path, prompt="hi", max_num_tokens=4)
 
 
+@unittest.skipUnless(
+    keras.config.backend() == "torch",
+    "LiteRT-LM export is only supported with the PyTorch backend.",
+)
 class TestLiteRTLmAdapterHelpers(TestCase):
     def test_cpu_default_device_scope_restores_device(self):
         """_cpu_default_device_scope restores the original default device."""
@@ -1096,14 +1095,6 @@ class TestLiteRTLmAdapterHelpers(TestCase):
         The adapter dispatches on spec.vision_input_style; a style/args
         disagreement is a hard error.
         """
-        from keras_hub.src.models.gemma3.gemma3_backbone import Gemma3Backbone
-        from keras_hub.src.models.gemma3.gemma3_causal_lm import Gemma3CausalLM
-        from keras_hub.src.models.gemma3.gemma3_vision_encoder import (
-            Gemma3VisionEncoder,
-        )
-        from keras_hub.src.utils.litertlm.adapter import KerasHubLiteRTAdapter
-        from keras_hub.src.utils.litertlm.model_specs import resolve_export_spec
-
         vision_encoder = Gemma3VisionEncoder(
             image_size=16,
             patch_size=4,
@@ -1157,9 +1148,6 @@ class TestLiteRTLmAdapterHelpers(TestCase):
         raise if invoked -- proving the dispatch rejects the call up front,
         without needing a real (expensive) Functional encoder.
         """
-        from keras_hub.src.utils.litertlm.adapter import (
-            KerasHubVisionEncoderAdapter,
-        )
 
         def _never_call(*args, **kwargs):
             raise AssertionError(
@@ -1251,8 +1239,6 @@ class TestHfTokenizerVocabCompatibility(TestCase):
 class TestBytePairToHFTokenizer(TestCase):
     def test_byte_pair_to_hf_tokenizer_roundtrip(self):
         """Verify converted tokenizer.json round-trips through HF tokenizers."""
-        import keras
-
         if keras.config.backend() != "torch":
             self.skipTest(
                 "BytePair tokenizer roundtrip requires torch backend."

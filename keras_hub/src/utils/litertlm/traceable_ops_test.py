@@ -1,8 +1,12 @@
 import unittest
+import unittest.mock
 
 import keras
 import numpy as np
 import torch
+from keras.src.backend.torch import core as torch_core
+from keras.src.backend.torch import nn as torch_backend_nn
+from keras.src.backend.torch import numpy as torch_backend_numpy
 
 from keras_hub.src.tests.test_case import TestCase
 from keras_hub.src.utils.litertlm import traceable_ops
@@ -21,10 +25,7 @@ def _to_np(x):
     "The litertlm traceable-op patches only exist for the PyTorch backend.",
 )
 class TraceableOpsParityTest(TestCase):
-    # -- one_hot --
     def test_one_hot_matches_original(self):
-        from keras.src.backend.torch import nn as torch_backend_nn
-
         cases = [
             ([0, 1, 2, 3], 5, -1, "float32"),
             ([0, 1, 2, 3], 5, 0, "float32"),
@@ -46,17 +47,12 @@ class TraceableOpsParityTest(TestCase):
                 self.assertAllClose(_to_np(original), _to_np(patched))
 
     def test_one_hot_rejects_sparse(self):
-        from keras.src.backend.torch import nn as torch_backend_nn
-
         with self.assertRaises(ValueError):
             torch_backend_nn.one_hot(torch.tensor([0]), 4, sparse=True)
         with self.assertRaises(ValueError):
             traceable_ops._patched_one_hot(torch.tensor([0]), 4, sparse=True)
 
-    # -- repeat --
     def test_repeat_matches_original(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
         for axis in (0, 1, 2, -1):
             for repeats in (1, 2, 3):
@@ -68,12 +64,10 @@ class TraceableOpsParityTest(TestCase):
                     self.assertAllClose(_to_np(original), _to_np(patched))
 
     def test_repeat_scalar_tensor_repeats_matches_original(self):
-        # A 0-D tensor `repeats` is not a plain Python `int`, so the
-        # upstream Keras `repeat` falls through to the `repeat_interleave`
+        # A 0-D tensor `repeats` is not a plain Python `int`, so Keras's
+        # torch-backend `repeat` falls through to the `repeat_interleave`
         # path, while `_traceable_repeat`'s `_is_scalar_integer` check takes
         # the unsqueeze+expand+reshape fast path instead. Values must match.
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         repeats = torch.tensor(2)
         original = torch_backend_numpy.repeat(x, repeats, axis=1)
@@ -90,19 +84,16 @@ class TraceableOpsParityTest(TestCase):
             traceable_ops._traceable_repeat(torch.zeros(2, 2), -1, axis=0)
 
     def test_repeat_no_axis_falls_back_to_original(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         x = torch.arange(6, dtype=torch.float32)
         original = torch_backend_numpy.repeat(x, 3, axis=None)
         patched = traceable_ops._traceable_repeat(x, 3, axis=None)
         self.assertAllClose(_to_np(original), _to_np(patched))
 
     def test_repeat_list_repeats_with_axis_delegates_to_original(self):
-        # Upstream `repeat` rejects a Python list `repeats` with ValueError;
-        # inside the patch scope the fallback must delegate to the captured
-        # original (mirroring that raise), not recurse into the patch.
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
+        # Keras's torch-backend `repeat` rejects a Python list `repeats`
+        # with ValueError; inside the patch scope the fallback must
+        # delegate to the captured original (mirroring that raise), not
+        # recurse into the patch.
         x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
         with self.assertRaises(ValueError):
             torch_backend_numpy.repeat(x, [1, 2], axis=0)
@@ -110,21 +101,16 @@ class TraceableOpsParityTest(TestCase):
             with self.assertRaises(ValueError):
                 torch_backend_numpy.repeat(x, [1, 2], axis=0)
 
-    # -- slice (via `_make_patched_slice`) --
     def test_slice_static_matches_original(self):
-        from keras.src.backend.torch import core as torch_core
-
         x = torch.arange(60, dtype=torch.float32).reshape(3, 4, 5)
-        patched_slice = traceable_ops._make_patched_slice()
+        patched_slice = traceable_ops._patched_slice
         original = torch_core.slice(x, [1, 1, 0], [2, 2, 5])
         patched = patched_slice(x, [1, 1, 0], [2, 2, 5])
         self.assertAllClose(_to_np(original), _to_np(patched))
 
     def test_slice_single_dynamic_dim_matches_original(self):
-        from keras.src.backend.torch import core as torch_core
-
         x = torch.arange(60, dtype=torch.float32).reshape(3, 4, 5)
-        patched_slice = traceable_ops._make_patched_slice()
+        patched_slice = traceable_ops._patched_slice
         for start in range(0, 3):
             with self.subTest(start=start):
                 start_t = torch.tensor(start)
@@ -136,10 +122,8 @@ class TraceableOpsParityTest(TestCase):
         # Regression check for the KV-cache read pattern used by
         # `KerasHubLiteRTAdapter`: slicing along a non-leading axis with a
         # dynamic start while the surrounding axes are fully covered.
-        from keras.src.backend.torch import core as torch_core
-
         x = torch.arange(2 * 4 * 5, dtype=torch.float32).reshape(2, 4, 5)
-        patched_slice = traceable_ops._make_patched_slice()
+        patched_slice = traceable_ops._patched_slice
         for start in range(0, 3):
             with self.subTest(start=start):
                 start_t = torch.tensor(start)
@@ -149,14 +133,11 @@ class TraceableOpsParityTest(TestCase):
 
     def test_slice_multiple_dynamic_dims_raises(self):
         x = torch.arange(60, dtype=torch.float32).reshape(3, 4, 5)
-        patched_slice = traceable_ops._make_patched_slice()
+        patched_slice = traceable_ops._patched_slice
         with self.assertRaises(NotImplementedError):
             patched_slice(x, [torch.tensor(0), torch.tensor(1), 0], [1, 1, 5])
 
-    # -- take --
     def test_take_embedding_lookup_matches_original(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         table = torch.arange(20, dtype=torch.float32).reshape(5, 4)
         indices = torch.tensor([0, 2, 4, 1])
         original = torch_backend_numpy.take(table, indices, axis=0)
@@ -164,8 +145,6 @@ class TraceableOpsParityTest(TestCase):
         self.assertAllClose(_to_np(original), _to_np(patched))
 
     def test_take_matches_original_various_axes(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         x = torch.arange(60, dtype=torch.float32).reshape(3, 4, 5)
         cases = [
             (torch.tensor([0, 2]), 0),
@@ -180,8 +159,6 @@ class TraceableOpsParityTest(TestCase):
                 self.assertAllClose(_to_np(original), _to_np(patched))
 
     def test_take_no_axis_matches_original(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
         indices = torch.tensor([0, 5, 11])
         original = torch_backend_numpy.take(x, indices, axis=None)
@@ -195,9 +172,9 @@ class TraceableOpsParityTest(TestCase):
 
         Note this deliberately does **not** compare against
         ``keras.src.backend.torch.numpy.take`` (the pattern every other
-        ``test_take_*`` case in this file uses): that upstream Keras
+        ``test_take_*`` case in this file uses): that Keras
         function has the exact same bug (it computes
-        ``x_dim = x.shape[0]`` before flattening for ``axis=None`), so it
+        ``x_dim = x.shape[0]`` before flattening for ``axis=None``), so it
         is not a valid reference here. Ground truth is real numpy's
         ``np.take(..., axis=None)``, which flattens first -- e.g. for a
         ``3x4`` input (12 elements), index ``-1`` must resolve to the last
@@ -211,10 +188,7 @@ class TraceableOpsParityTest(TestCase):
         patched = traceable_ops._patched_take(x, indices, axis=None)
         self.assertAllClose(expected, _to_np(patched))
 
-    # -- scatter_update --
     def test_scatter_update_matches_original(self):
-        from keras.src.backend.torch import core as torch_core
-
         inputs = torch.zeros((4, 4), dtype=torch.float32)
         indices = torch.tensor([[0, 0], [1, 1], [2, 2]])
         updates = torch.tensor([10.0, 20.0, 30.0])
@@ -231,8 +205,6 @@ class TraceableOpsParityTest(TestCase):
     def test_scatter_update_overlapping_indices_matches_original(self):
         # Duplicate indices exercise the accumulation/reduction semantics
         # more thoroughly than the diagonal case above.
-        from keras.src.backend.torch import core as torch_core
-
         inputs = torch.full((3, 3), 2.0, dtype=torch.float32)
         indices = torch.tensor([[0, 0], [0, 0], [1, 1]])
         updates = torch.tensor([3.0, 5.0, 7.0])
@@ -255,7 +227,6 @@ class TraceableOpsParityTest(TestCase):
                 inputs, indices, updates, reduction="bogus"
             )
 
-    # -- dot_product_attention --
     def _reference_attention_inputs(self, num_query_heads, num_kv_heads):
         rng = np.random.default_rng(0)
         batch, q_len, kv_len, head_dim = 2, 3, 4, 8
@@ -275,8 +246,6 @@ class TraceableOpsParityTest(TestCase):
 
     def test_dot_product_attention_matches_original_mha(self):
         """Standard multi-head attention (num_query_heads == num_kv_heads)."""
-        from keras.src.backend.torch import nn as torch_backend_nn
-
         query, key, value = self._reference_attention_inputs(4, 4)
         original = torch_backend_nn.dot_product_attention(
             query, key, value, is_causal=True
@@ -299,8 +268,6 @@ class TraceableOpsParityTest(TestCase):
         batched matmul with no explicit GQA broadcast -- still matches, i.e.
         that its caller must pre-broadcast key/value to the query head count.
         """
-        from keras.src.backend.torch import nn as torch_backend_nn
-
         query, key, value = self._reference_attention_inputs(4, 1)
         original = torch_backend_nn.dot_product_attention(
             query, key, value, is_causal=True
@@ -322,8 +289,6 @@ class TraceableOpsParityTest(TestCase):
         )
 
     def test_dot_product_attention_with_mask_matches_original(self):
-        from keras.src.backend.torch import nn as torch_backend_nn
-
         query, key, value = self._reference_attention_inputs(2, 2)
         batch, q_len, _, _ = query.shape
         kv_len = key.shape[1]
@@ -343,8 +308,8 @@ class TraceableOpsParityTest(TestCase):
     def test_dot_product_attention_soft_cap_matches_manual_reference(self):
         """Attention-logit soft-capping (used by Gemma-family models).
 
-        The upstream Keras torch-backend ``dot_product_attention`` accepts
-        an ``attn_logits_soft_cap`` parameter but never applies it (it is
+        Keras's torch-backend ``dot_product_attention`` accepts an
+        ``attn_logits_soft_cap`` parameter but never applies it (it is
         always routed through ``torch.nn.functional.
         scaled_dot_product_attention``, which has no soft-cap support), so
         there is no meaningful "original" to compare against here. Instead,
@@ -371,10 +336,7 @@ class TraceableOpsParityTest(TestCase):
             _to_np(expected), _to_np(patched), atol=1e-5, rtol=1e-5
         )
 
-    # -- amax --
     def test_amax_matches_original(self):
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         cases = [
             (torch.randn(2, 3, 4, 5), -1, True),  # 4-D last axis, keepdims
             (torch.randn(2, 3, 4, 5), -1, False),  # 4-D last axis, no keepdims
@@ -419,15 +381,10 @@ class TraceableOpsParityTest(TestCase):
 
     def test_amax_public_ops_max_4d_matches(self):
         # The public keras op that GPT-OSS attention actually calls.
-        import unittest.mock
-
-        from keras import ops as keras_ops
-        from keras.src.backend.torch import numpy as torch_backend_numpy
-
         x = torch.randn(2, 3, 4, 5)
-        ref = keras_ops.max(x, axis=-1, keepdims=True)
+        ref = keras.ops.max(x, axis=-1, keepdims=True)
         with unittest.mock.patch.object(
             torch_backend_numpy, "amax", traceable_ops._patched_amax
         ):
-            got = keras_ops.max(x, axis=-1, keepdims=True)
+            got = keras.ops.max(x, axis=-1, keepdims=True)
         self.assertTrue(torch.equal(ref, got))

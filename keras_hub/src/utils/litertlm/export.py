@@ -23,6 +23,7 @@ from keras_hub.src.utils.litertlm.hf_tokenizer_converter import (
     materialize_hf_tokenizer_json,
 )
 from keras_hub.src.utils.litertlm.model_specs import SamplerConfig
+from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
 from keras_hub.src.utils.litertlm.model_specs import resolve_export_spec
 from keras_hub.src.utils.preset_utils import TOKENIZER_ASSET_DIR
 
@@ -33,22 +34,22 @@ _QUANTIZATION_RECIPES_NOTE = """
 Supported ``quant_config`` recipes (from
 ``litert_torch.generative.quantize.quant_recipes``):
 
-- ``full_dynamic_recipe()`` — dynamic-range quantization of weights
+- ``full_dynamic_recipe()``: dynamic-range quantization of weights
   (activations stay FP32). Recommended default.
-- ``full_weight_only_recipe()`` — weight-only quantization. Weights are
+- ``full_weight_only_recipe()``: weight-only quantization. Weights are
   statically quantized; activations remain FP32.
-- ``full_fp16_recipe()`` — FP16 weights and activations.
+- ``full_fp16_recipe()``: FP16 weights and activations.
 
-Each recipe accepts the following parameters:
+Each recipe accepts ``mcfg``, an optional ``ModelConfig`` for the target
+model (usually omitted for KerasHub exports). The dynamic and weight-only
+recipes additionally accept:
 
-- ``mcfg`` — optional ``ModelConfig`` for the target model. Usually omitted
-  for KerasHub exports.
-- ``weight_dtype`` — one of:
+- ``weight_dtype``: one of:
   ``quant_attrs.Dtype.INT8`` (default),
   ``quant_attrs.Dtype.INT4``,
   ``quant_attrs.Dtype.FP16``,
   ``quant_attrs.Dtype.FP32``.
-- ``granularity`` — one of:
+- ``granularity``: one of:
   ``quant_attrs.Granularity.CHANNELWISE`` (default),
   ``quant_attrs.Granularity.BLOCKWISE_32``,
   ``quant_attrs.Granularity.BLOCKWISE_64``,
@@ -151,7 +152,7 @@ def _validate_quant_config(quant_config):
         raise ValueError(
             "`quant_config` must be an instance of "
             "`litert_torch.quantize.quant_config.QuantConfig` or None. "
-            f"Received: {type(quant_config).__name__}."
+            f"Received: quant_config={quant_config!r}."
         )
 
 
@@ -261,15 +262,17 @@ def _validate_export_args(
 ):
     """Fail fast on invalid export arguments.
 
-    Returns a ``(prefill_seq_lens, backend_constraint)`` tuple: the
-    normalized list of prefill sequence lengths, and the normalized
-    (lowercased) ``backend_constraint`` string (or ``None``). Callers must
-    use the returned ``backend_constraint`` -- not the original argument --
-    so the lowercased value actually reaches ``_assemble_bundle`` /
-    ``builder.add_tflite_model``. Importing ``litert_torch`` is deferred to
-    the orchestrator so that the JAX ``jax_enable_x64`` side effect can be
-    kept under one preserve/restore context that covers both import and
-    tracing.
+    Importing ``litert_torch`` is deferred to the orchestrator so that the
+    JAX ``jax_enable_x64`` side effect can be kept under one
+    preserve/restore context that covers both import and tracing.
+
+    Returns:
+        A ``(prefill_seq_lens, backend_constraint)`` tuple: the normalized
+        list of prefill sequence lengths, and the normalized (lowercased)
+        ``backend_constraint`` string (or ``None``). Callers must use the
+        returned ``backend_constraint`` -- not the original argument -- so
+        the lowercased value actually reaches ``_assemble_bundle`` /
+        ``builder.add_tflite_model``.
     """
     if not path.endswith(".litertlm"):
         raise ValueError(
@@ -290,16 +293,6 @@ def _validate_export_args(
                 f"Received: {backend_constraint!r}"
             )
         backend_constraint = backend_constraint.lower()
-        # Allowed values track upstream `litert_lm_builder.Backend`. Upstream
-        # also accepts comma-separated lists; KerasHub deliberately accepts a
-        # single backend only.
-        litert_lm_builder = _import_litert_lm_builder()
-        valid_backends = {b.value for b in litert_lm_builder.Backend}
-        if backend_constraint not in valid_backends:
-            raise ValueError(
-                f"Invalid backend_constraint: {backend_constraint!r}. "
-                f"Must be one of {sorted(valid_backends)}."
-            )
 
     if hf_tokenizer_path is not None:
         hf_tokenizer_path = os.fspath(hf_tokenizer_path)
@@ -352,6 +345,20 @@ def _validate_export_args(
             "LiteRT-LM export requires `litert-torch`. "
             "Install it with: pip install litert-torch"
         )
+
+    # Validate `backend_constraint` against the builder's enum only after the
+    # availability checks above, so under-supported environments get the
+    # friendly torch/backend/dependency errors first. Allowed values track
+    # `litert_lm_builder.Backend`. The builder also accepts comma-separated
+    # lists; KerasHub deliberately accepts a single backend only.
+    if backend_constraint is not None:
+        litert_lm_builder = _import_litert_lm_builder()
+        valid_backends = {b.value for b in litert_lm_builder.Backend}
+        if backend_constraint not in valid_backends:
+            raise ValueError(
+                f"Invalid backend_constraint: {backend_constraint!r}. "
+                f"Must be one of {sorted(valid_backends)}."
+            )
 
     # Normalise prefill_seq_len to a sorted list. Cache-length checks are left
     # to the orchestrator because ``cache_length`` is not known until after
@@ -528,7 +535,7 @@ def _build_vision_encoder_sample_inputs(
         }
     # The LiteRT-LM runtime rejects encoder inputs that are not 3- or 4-D
     # (it feeds one image per call), so the signature is traced with a
-    # single-image [B, H, W, 3] input — no max_images axis. The adapter
+    # single-image [B, H, W, 3] input -- no max_images axis. The adapter
     # reintroduces the N=1 axis before calling the KerasHub encoder.
     return {
         "images": torch.zeros(
@@ -553,7 +560,7 @@ def _build_vision_adapter_sample_inputs(
     """Create concrete sample inputs for a separate vision-adapter signature.
 
     The LiteRT-LM runtime chains encoder -> adapter per image, so the adapter
-    consumes a single image's features [B, tokens_per_image, dim] — no
+    consumes a single image's features [B, tokens_per_image, dim] -- no
     max_images axis. (Tracing it with batch_size * max_images mismatches the
     single-image encoder output the runtime feeds it at inference time.)
     """
@@ -788,7 +795,7 @@ def _assemble_bundle(
             backend_constraint=backend_constraint,
         )
         if eoi_tflite_path is not None:
-            # Ordered after VISION_ADAPTER, matching upstream's section
+            # Ordered after VISION_ADAPTER, matching litert-torch's section
             # order (PREFILL_DECODE -> ... -> END_OF_VISION).
             builder.add_tflite_model(
                 eoi_tflite_path,
@@ -860,7 +867,7 @@ def export_to_litertlm(
     ``VISION_ENCODER`` (raw images/patches -> features),
     ``VISION_ADAPTER`` (features -> ``mm_embedding``), and
     ``PREFILL_DECODE`` (text + ``mm_embedding`` -> KV caches/logits). This
-    matches the upstream LiteRT-LM multimodal runtime contract. Families
+    matches the LiteRT-LM multimodal runtime contract. Families
     that declare an end-of-image token (``LiteRTLMExportSpec.
     end_of_vision_token``, e.g. Gemma3/Gemma4) additionally get a fourth,
     input-less ``END_OF_VISION`` model whose only output is that token's
@@ -883,11 +890,11 @@ def export_to_litertlm(
     ``_QUANTIZATION_RECIPES_NOTE`` for supported recipes and attributes.
 
     Args:
-        model: A KerasHub ``CausalLM`` instance with an attached preprocessor
-            and tokenizer.
+        model: ``CausalLM``. The KerasHub model to export, with an attached
+            preprocessor and tokenizer.
         path: str. Path to save the ``.litertlm`` file.
-        backend_constraint: Optional LiteRT-LM backend constraint, such as
-            ``"cpu"`` or ``"gpu"``. Defaults to ``None``.
+        backend_constraint: Optional str. LiteRT-LM backend constraint, such
+            as ``"cpu"`` or ``"gpu"``. Defaults to ``None``.
         prefill_seq_len: int or list[int]. Sequence length(s) used when
             tracing the prefill signature(s). Each value must not exceed
             ``cache_length``. Defaults to ``cache_length`` itself.
@@ -911,7 +918,7 @@ def export_to_litertlm(
             separate ``VISION_ENCODER`` and ``VISION_ADAPTER`` TFLite models,
             and have ``PREFILL_DECODE`` consume pre-computed ``mm_embedding``
             tensors instead of raw images. Defaults to ``False``. Either way
-            the exported bundle is a complete multimodal model —
+            the exported bundle is a complete multimodal model --
             ``PREFILL_DECODE`` always consumes text tokens; this flag only
             controls whether vision is baked into that trace or factored
             into reusable models, never producing a vision-only export.
@@ -929,10 +936,9 @@ def export_to_litertlm(
             field is populated from it (mirroring litert-torch export_hf's
             conditional sampler semantics). The only named preset keras-hub
             ships is ``GREEDY_SAMPLER_CONFIG`` (``top_k=1``), for forcing
-            deterministic greedy generation during host-vs-device
-            verification. Defaults to ``None``, which leaves
-            ``sampler_params`` entirely unset so the runtime chooses its own
-            sampling policy.
+            deterministic greedy generation on-device. Defaults to ``None``,
+            which leaves ``sampler_params`` entirely unset so the runtime
+            chooses its own sampling policy.
         llm_model_type: Optional str. Explicit ``LlmMetadata.llm_model_type``
             override for presets that are architecturally identical to another
             family and so cannot be auto-detected by class, config, or
@@ -972,8 +978,8 @@ def export_to_litertlm(
         raise ValueError(
             "`sampler_config` must be a "
             "`keras_hub.src.utils.litertlm.model_specs.SamplerConfig` "
-            "instance (e.g. `GREEDY_SAMPLER_CONFIG`), got "
-            f"{type(sampler_config).__name__}."
+            "instance (e.g. `GREEDY_SAMPLER_CONFIG`). "
+            f"Received: sampler_config={sampler_config!r}."
         )
     tokenizer = _get_tokenizer(model)
     # Use the normalized (lowercased) `backend_constraint` returned by
@@ -991,7 +997,6 @@ def export_to_litertlm(
     # that a JAX/TF caller without torch gets the friendly backend error.
     from keras_hub.src.utils.litertlm.adapter import KerasHubLiteRTAdapter
     from keras_hub.src.utils.litertlm.adapter import _cpu_default_device_scope
-    from keras_hub.src.utils.litertlm.model_specs import _get_vision_encoder
 
     # Fail fast on cache structures the adapter cannot build, before any
     # cache-config derivation or tracing; the spec names the mismatch
@@ -1074,14 +1079,12 @@ def export_to_litertlm(
         and any(seq_len != cache_length for seq_len in prefill_seq_lens)
     ):
         raise ValueError(
-            f"Multimodal LiteRT-LM export currently requires all "
+            "Multimodal LiteRT-LM export currently requires all "
             f"`prefill_seq_len` values ({prefill_seq_lens}) to match the "
-            f"cache_length ({cache_length}). This restriction is enforced for "
-            f"all vision-capable families (Gemma3, Gemma3n, Gemma4, "
-            f"PaliGemma) pending a per-family assessment; it was originally "
-            f"characterized as specific to Gemma3's image attention-mask "
-            f"computation but has not been verified to be Gemma3-specific. "
-            f"Pass a single `prefill_seq_len` equal to `cache_length`."
+            f"cache_length ({cache_length}). This restriction is enforced "
+            "for all vision-capable families (Gemma3, Gemma3n, Gemma4, "
+            "PaliGemma) pending a per-family assessment. Pass a single "
+            "`prefill_seq_len` equal to `cache_length`."
         )
 
     # Hoist vision shape values used both in prefill-input building and in
@@ -1095,11 +1098,7 @@ def export_to_litertlm(
 
     dtype = _torch_dtype_from_model(model)
 
-    # Phases 1-2 (above) resolve the model-family spec and compute every
-    # per-export-run setting. Bundle them into a single immutable plan so the
-    # remaining phases (building sample inputs, tracing/converting, and
-    # assembling the bundle) take one object instead of a long,
-    # order-sensitive positional-argument list.
+    # Bundle all resolved per-export-run settings into one immutable plan.
     plan = ExportPlan(
         spec=spec,
         num_layers=num_layers,
@@ -1329,7 +1328,7 @@ def _build_audio_sample_inputs(
     num_audio_tokens,
     seq_len,
     dtype,
-    audio_input_feat_size=128,
+    audio_input_feat_size,
 ):
     """Create concrete audio sample tensors for a prefill signature."""
     device = "cpu"
@@ -1470,8 +1469,8 @@ def _build_llm_metadata(
 
         sp = meta.sampler_params
         top_k = sampler_config.top_k
-        if sampler_config.top_k is not None:
-            sp.k = sampler_config.top_k
+        if top_k is not None:
+            sp.k = top_k
         if sampler_config.top_p is not None:
             sp.p = sampler_config.top_p
         if sampler_config.temperature is not None:

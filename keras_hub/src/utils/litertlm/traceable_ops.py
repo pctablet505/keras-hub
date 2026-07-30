@@ -48,83 +48,77 @@ def _normalize_start_indices(start_indices):
     return list(start_indices.reshape(-1).unbind())
 
 
-def _make_patched_slice():
-    """Return a traceable ``slice`` replacement."""
+def _patched_slice(inputs, start_indices, shape):
+    """Traceable replacement for Keras torch-backend ``slice``."""
+    inputs = torch_core.convert_to_tensor(inputs)
 
-    def _patched_slice(inputs, start_indices, shape):
-        inputs = torch_core.convert_to_tensor(inputs)
+    starts = _normalize_start_indices(start_indices)
 
-        starts = _normalize_start_indices(start_indices)
+    if isinstance(shape, (list, tuple)):
+        lengths = list(shape)
+    else:
+        shape = torch_core.convert_to_tensor(shape, dtype="int64")
+        lengths = list(shape.reshape(-1).unbind())
 
-        if isinstance(shape, (list, tuple)):
-            lengths = list(shape)
-        else:
-            shape = torch_core.convert_to_tensor(shape, dtype="int64")
-            lengths = list(shape.reshape(-1).unbind())
-
-        def _is_dynamic(value):
-            # ``torch.SymInt`` values are not plain Python ints and require
-            # tensor-based slicing to avoid data-dependent guards.
-            return isinstance(value, torch.Tensor) or isinstance(
-                value, torch.SymInt
-            )
-
-        # Dimensions whose start or length is dynamic.
-        dynamic_dims = [
-            dim
-            for dim, (start, length) in enumerate(zip(starts, lengths))
-            if _is_dynamic(start) or _is_dynamic(length)
-        ]
-
-        # No dynamic values → use Python slice objects directly.
-        if len(dynamic_dims) == 0:
-            slices = tuple(
-                slice(start, start + length)
-                for start, length in zip(starts, lengths)
-            )
-            return inputs[slices]
-
-        # Single dynamic dimension → build indices with ``torch.arange`` and
-        # use ``index_select``. This keeps the output shape symbolic and avoids
-        # unbacked symbols that ``torch.export`` cannot resolve.
-        if len(dynamic_dims) == 1:
-            dim = dynamic_dims[0]
-            start = starts[dim]
-            if not isinstance(start, torch.Tensor):
-                start = torch_core.convert_to_tensor(
-                    start, dtype="int32", device=inputs.device
-                )
-            start = start.reshape(())
-            length = lengths[dim]
-
-            indices = torch.arange(
-                length, dtype=torch.int32, device=inputs.device
-            )
-            indices = indices + start
-            result = torch.index_select(inputs, dim, indices)
-
-            # Apply static slicing for the remaining dimensions.
-            for d, (s, l) in enumerate(zip(starts, lengths)):
-                if d != dim and (s != 0 or l != result.shape[d]):
-                    result = torch.narrow(result, d, s, l)
-            return result
-
-        # Multiple dynamic dimensions are not supported for LiteRT-LM export
-        # because ``torch.export`` cannot resolve the resulting unbacked
-        # symbols. Fail fast with an actionable message instead of falling
-        # back to the original implementation and producing a cryptic export
-        # error.
-        raise NotImplementedError(
-            "Slicing with multiple dynamic dimensions is not supported for "
-            "LiteRT-LM export. Received dynamic dims "
-            f"{dynamic_dims}. Consider materializing start/length values as "
-            "static ints or simplifying the slice operation."
+    def _is_dynamic(value):
+        # ``torch.SymInt`` values are not plain Python ints and require
+        # tensor-based slicing to avoid data-dependent guards.
+        return isinstance(value, torch.Tensor) or isinstance(
+            value, torch.SymInt
         )
 
-    return _patched_slice
+    # Dimensions whose start or length is dynamic.
+    dynamic_dims = [
+        dim
+        for dim, (start, length) in enumerate(zip(starts, lengths))
+        if _is_dynamic(start) or _is_dynamic(length)
+    ]
+
+    # No dynamic values -> use Python slice objects directly.
+    if len(dynamic_dims) == 0:
+        slices = tuple(
+            slice(start, start + length)
+            for start, length in zip(starts, lengths)
+        )
+        return inputs[slices]
+
+    # Single dynamic dimension -> build indices with ``torch.arange`` and
+    # use ``index_select``. This keeps the output shape symbolic and avoids
+    # unbacked symbols that ``torch.export`` cannot resolve.
+    if len(dynamic_dims) == 1:
+        dim = dynamic_dims[0]
+        start = starts[dim]
+        if not isinstance(start, torch.Tensor):
+            start = torch_core.convert_to_tensor(
+                start, dtype="int32", device=inputs.device
+            )
+        start = start.reshape(())
+        length = lengths[dim]
+
+        indices = torch.arange(length, dtype=torch.int32, device=inputs.device)
+        indices = indices + start
+        result = torch.index_select(inputs, dim, indices)
+
+        # Apply static slicing for the remaining dimensions.
+        for d, (s, l) in enumerate(zip(starts, lengths)):
+            if d != dim and (s != 0 or l != result.shape[d]):
+                result = torch.narrow(result, d, s, l)
+        return result
+
+    # Multiple dynamic dimensions are not supported for LiteRT-LM export
+    # because ``torch.export`` cannot resolve the resulting unbacked
+    # symbols. Fail fast with an actionable message instead of falling
+    # back to the original implementation and producing a cryptic export
+    # error.
+    raise NotImplementedError(
+        "Slicing with multiple dynamic dimensions is not supported for "
+        "LiteRT-LM export. Received dynamic dims "
+        f"{dynamic_dims}. Consider materializing start/length values as "
+        "static ints or simplifying the slice operation."
+    )
 
 
-_traceable_slice_scope = _make_scope(torch_core, "slice", _make_patched_slice())
+_traceable_slice_scope = _make_scope(torch_core, "slice", _patched_slice)
 
 
 def _traceable_dot_product_attention(
@@ -159,6 +153,11 @@ def _traceable_dot_product_attention(
     head count before calling it, so this is not a behavior change in
     practice -- but a caller relying on the original op's implicit GQA
     broadcast would get silently wrong (shape-broadcast) results here.
+
+    Two further divergences from the original op: ``bias`` and ``mask`` are
+    applied additively instead of raising when both are passed, and input
+    ranks are not validated. No exported family passes ``bias``, so neither
+    path is exercised during export.
     """
     del flash_attention  # Fused flash attention is not exportable.
 
@@ -259,11 +258,14 @@ def _patched_one_hot(x, num_classes, axis=-1, dtype=None, sparse=False):
     output = torch_core.convert_to_tensor(output, dtype=dtype)
     dims = output.dim()
     if axis < 0:
+        original_axis = axis
         axis = dims + axis
+    else:
+        original_axis = axis
     if axis < 0 or axis >= dims:
         raise ValueError(
-            f"`axis` {axis} is out of bounds for one-hot output with "
-            f"{dims} dimensions."
+            "`axis` is out of bounds for one-hot output with "
+            f"{dims} dimensions. Received: axis={original_axis}."
         )
     if axis != dims - 1:
         new_axes_order = list(range(dims))
@@ -427,8 +429,8 @@ def _patched_amax(x, axis=None, keepdims=False):
     ``RuntimeError: NHWC node rewriter not found: amax``. GPT-OSS hits this in
     its attention-sink softmax stabilization
     (``gpt_oss_attention.py``: ``ops.max(combined_logits, axis=-1,
-    keepdims=True)`` on a ``[batch, heads, q, k]`` tensor); the upstream gap is
-    https://github.com/google-ai-edge/litert-torch/issues/1126.
+    keepdims=True)`` on a ``[batch, heads, q, k]`` tensor); the litert-torch
+    gap is https://github.com/google-ai-edge/litert-torch/issues/1126.
 
     For the single-integer-axis reduction of a 4-D tensor -- the only case that
     trips the missing rewriter -- this routes through ``torch.max(dim=...)``,

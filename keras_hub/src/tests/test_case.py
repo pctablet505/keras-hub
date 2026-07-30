@@ -967,6 +967,12 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         """Compare Keras eager and TFLite prefill/decode outputs.
 
         Args:
+            model: The KerasHub ``CausalLM`` producing the eager reference.
+            interpreter: The TFLite interpreter built from the exported
+                bundle's PREFILL_DECODE section.
+            input_data: A 2-D int token array ``[batch, seq_len]``.
+            atol: Absolute tolerance for the logits comparison.
+            rtol: Relative tolerance for the logits comparison.
             cache_length: The exact cache length the bundle under test was
                 traced with (see `run_litertlm_export_test`). Threading it
                 through explicitly, rather than re-deriving it independently,
@@ -987,7 +993,7 @@ class TestCase(tf.test.TestCase, parameterized.TestCase):
         if tokens_np.ndim != 2:
             raise ValueError(
                 "`input_data` for LiteRT-LM numeric parity must be a 2-D "
-                f"token tensor. Received shape: {tokens_np.shape}"
+                f"token tensor. Received: input_data.shape={tokens_np.shape}."
             )
 
         B, T = tokens_np.shape

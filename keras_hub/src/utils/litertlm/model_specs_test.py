@@ -75,8 +75,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
                 spec = spec_factory()
                 self.assertIsInstance(spec, LiteRTLMExportSpec)
 
-    # -- Representative per-family resolution ------------------------------
-    #
     # Tiny, randomly-initialized instances, matching the pattern every
     # `*_causal_lm_test.py` in this repo already uses for cheap model
     # construction. `resolve_export_spec` only performs `isinstance` checks,
@@ -336,8 +334,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         self.assertIsInstance(spec, Phi3Spec)
         self.assertEqual(spec.model_type, "generic_model")
 
-    # -- Exportability gate --------------------------------------------------
-
     def test_gemma4_assistant_check_exportable_raises(self):
         """`Gemma4AssistantCausalLM` resolves to `Gemma4AssistantSpec`, whose
         `check_exportable` fails fast with the MTP-draft explanation instead
@@ -356,8 +352,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
             LiteRTLMExportSpec().check_exportable(self._tiny_llama())
         )
 
-    # -- Chat-turn stop-token overrides -------------------------------------
-    #
     # Dependency-free checks of `get_chat_stop_token_ids` against small fake
     # tokenizer objects -- no real KerasHub tokenizer or torch/litert
     # dependency needed, since the method only calls `token_to_id`/reads
@@ -431,8 +425,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         )
         self.assertEqual(Phi3Spec().get_chat_stop_token_ids(tokenizer), [])
 
-    # -- Unsupported cache-structure messaging ------------------------------
-
     def test_base_spec_describes_unsupported_cache_structure_generically(self):
         """The default `describe_unsupported_cache_structure` must name the
         actual mismatched `cache_structure` value generically, without any
@@ -453,8 +445,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         message = Qwen3_5Spec().describe_unsupported_cache_structure()
         self.assertIn("hybrid full_attention/linear_attention", message)
 
-    # -- Audio input style --------------------------------------------------
-    #
     # Every audio-capable family must declare an `audio_input_style`
     # matching how its encoder consumes input.
 
@@ -474,7 +464,27 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         self.assertIsNone(Gemma3Spec().audio_input_style)
         self.assertIsNone(PaliGemmaSpec().audio_input_style)
 
-    # -- flatten_image_batch (single-image ViT declaration) ----------------
+    def test_gemma3n_audio_metadata_pins_gemma4_token_strings(self):
+        """Gemma3n's audio metadata deliberately uses Gemma4's token strings
+        (golden reference bundles); regression-guard against deriving them
+        from Gemma3n's own `<start_of_audio>`/`<end_of_audio>` tokens."""
+        meta = types.SimpleNamespace(
+            llm_model_type=types.SimpleNamespace(
+                gemma3n=types.SimpleNamespace(
+                    start_of_audio_token=types.SimpleNamespace(token_str=""),
+                    end_of_audio_token=types.SimpleNamespace(token_str=""),
+                )
+            )
+        )
+        Gemma3nSpec().populate_audio_metadata(meta, None)
+        self.assertEqual(
+            meta.llm_model_type.gemma3n.start_of_audio_token.token_str,
+            "<|audio>",
+        )
+        self.assertEqual(
+            meta.llm_model_type.gemma3n.end_of_audio_token.token_str,
+            "<audio|>",
+        )
 
     def test_single_image_family_declares_flatten_image_batch(self):
         """PaliGemma's ViT is 4-D-only; its spec must declare
@@ -489,8 +499,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         self.assertFalse(Gemma3Spec().flatten_image_batch)
         self.assertFalse(Gemma3nSpec().flatten_image_batch)
         self.assertFalse(Gemma4Spec().flatten_image_batch)
-
-    # -- get_max_images_per_prompt (explicit, no silent default) -----------
 
     def test_max_images_reads_preprocessor_attribute(self):
         pre = types.SimpleNamespace(max_images_per_prompt=4)
@@ -510,8 +518,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         with self.assertRaisesRegex(ValueError, "flatten_image_batch=False"):
             Gemma4Spec().get_max_images_per_prompt(pre)
 
-    # -- allows_vision_bucketing --------------------------------------------
-    #
     # These tests lock the family-wide default (False) so a per-family
     # relaxation is a deliberate, visible one-line override.
 
@@ -533,8 +539,6 @@ class ExportSpecRegistryIntegrityTest(TestCase):
         self.assertFalse(LiteRTLMExportSpec().allows_vision_bucketing)
         self.assertFalse(GemmaSpec().allows_vision_bucketing)
 
-    # -- supports_separate_vision --------------------------------------------
-    #
     # These tests lock the {baked, separate} support matrix so a change is
     # deliberate.
 
